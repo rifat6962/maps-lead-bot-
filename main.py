@@ -9,7 +9,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 )
-from playwright.async_api import async_playwright # <-- ADDED FOR BLAZING FAST SCRAPING
+from playwright.sync_api import sync_playwright # <-- SWITCHED TO SYNC API TO PREVENT FREEZING
 
 load_dotenv()
 
@@ -33,157 +33,122 @@ def get_headers():
     }
 
 # ══════════════════════════════════════════════
-#   1. BLAZING FAST PLAYWRIGHT GOOGLE MAPS SCRAPER
+#   1. ROBUST SYNC GOOGLE MAPS SCRAPER
 # ══════════════════════════════════════════════
 class GoogleMapsScraper:
-    def get_page(self, keyword, location, start):
-        # To perfectly integrate with the existing pagination loop, 
-        # we fetch a massive concurrent batch on start=0, and return empty on subsequent calls 
-        # to trigger the AI to generate the next keyword.
-        if start > 0:
-            return []
-            
-        results = []
+    def __init__(self, context):
+        self.context = context
+
+    def safe_extract(self, page, selector, attribute="innerText"):
+        """Safely extracts data using modern Playwright locators."""
         try:
-            # Create a safe event loop for the thread
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            results = loop.run_until_complete(self._scrape_concurrently(keyword, location))
-        except Exception as e:
-            print(f"Playwright error: {e}")
-        finally:
-            loop.close()
-            
-        # Phase 2: Fallback to Maps JSON if Playwright fails completely
-        if not results:
-            results = self._phase2_search(keyword, location)
-            
-        return results
-
-    async def _scrape_concurrently(self, keyword, location):
-        query = urllib.parse.quote_plus(f"{keyword} in {location}")
-        # Fetch top 4 pages concurrently (80 results). 
-        # Rotating keywords via AI is much faster/better than deep pagination.
-        pages_to_fetch = [0, 20, 40, 60] 
-        all_results = []
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True, 
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu"
-                ]
-            )
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080}
-            )
-            
-            # Block heavy resources (images, css, fonts) for blazing speed
-            async def route_intercept(route):
-                if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
-                    await route.abort()
+            element = page.locator(selector).first
+            if element.count() > 0:
+                if attribute == "innerText":
+                    return element.inner_text(timeout=2000)
                 else:
-                    await route.continue_()
-            await context.route("**/*", route_intercept)
+                    return element.get_attribute(attribute, timeout=2000)
+        except Exception:
+            pass
+        return "N/A"
 
-            async def fetch_page(start_val):
-                url = f"https://www.google.com/search?q={query}&tbm=lcl&start={start_val}&num=20&hl=en"
-                page = await context.new_page()
-                page_results = []
-                try:
-                    await page.goto(url, timeout=30000)
-                    await page.wait_for_timeout(1500) # Wait for JS to render local pack
-                    html = await page.content()
-                    soup = BeautifulSoup(html, 'html.parser')
-                    
-                    blocks = soup.select('div.VkpGBb, div.rllt__details, div[jscontroller]')
-                    if not blocks:
-                        blocks = soup.select('div.uMdZh, div.cXedhc')
-                        
-                    for block in blocks:
-                        text_content = block.get_text(separator=' ', strip=True)
-                        
-                        name_el = block.select_one('div[role="heading"], .dbg0pd, span.OSrXXb')
-                        name = name_el.get_text(strip=True) if name_el else "N/A"
-                        if name == "N/A" or len(name) < 3: continue
-                            
-                        rating_match = re.search(r'(\d[\.,]\d)\s*[\(\d]', text_content)
-                        rating = rating_match.group(1).replace(',', '.') if rating_match else "N/A"
-                        
-                        ph = re.search(r'(\+?1?\s?[\(\-]?\d{3}[\)\-\s]?\s?\d{3}[\-\s]?\d{4}|\+?880[\s\-]?\d{2}[\s\-]?\d{8}|\+?8801[3-9]\d{8}|01[3-9]\d{8})', text_content)
-                        phone = ph.group(0).strip() if ph else "N/A"
-                        
-                        website = "N/A"
-                        for a in block.select('a[href]'):
-                            href = a['href']
-                            if '/url?q=' in href:
-                                clean = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
-                                if 'google' not in clean.lower() and clean.startswith('http'):
-                                    website = clean; break
-                            elif href.startswith('http') and 'google' not in href.lower():
-                                website = href; break
-                                
-                        page_results.append({
-                            "Name": name,
-                            "Phone": phone,
-                            "Website": website,
-                            "Rating": rating,
-                            "Address": location,
-                            "Category": keyword,
-                            "Maps_Link": f"https://www.google.com/maps/search/{urllib.parse.quote_plus(name + ' ' + location)}"
-                        })
-                except Exception as e:
-                    pass
-                finally:
-                    await page.close()
-                return page_results
-
-            # Execute all page fetches concurrently!
-            tasks = [fetch_page(s) for s in pages_to_fetch]
-            results_arrays = await asyncio.gather(*tasks)
-            
-            for arr in results_arrays:
-                all_results.extend(arr)
-                
-            await browser.close()
-            
-        return all_results
-
-    def _phase2_search(self, keyword, location):
-        results = []
-        query = urllib.parse.quote_plus(f"{keyword} {location}")
-        url = f"https://www.google.com/maps/search/{query}"
+    def scrape_keyword(self, keyword, location, max_leads, seen_names, job_id, jobs_dict, email_lib, max_rating):
+        """Scrolls Google Maps and extracts leads synchronously."""
+        page = self.context.new_page()
         try:
-            r = requests.get(url, headers=get_headers(), timeout=15)
-            text = r.text
-            names = re.findall(r'"([^"]{3,60})"(?:,null){0,3},"[^"]*","[^"]*"', text)
-            phones = re.findall(r'(\+?1?\s?[\(\-]?\d{3}[\)\-\s]?\s?\d{3}[\-\s]?\d{4})', text)
-            websites = re.findall(r'https?://(?!(?:www\.google|maps\.google|goo\.gl|googleapis|facebook|instagram|twitter))[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}(?:/[^\s"\'<>]*)?', text)
-            ratings = re.findall(r'"(\d\.\d)"', text)
+            query = f"{keyword} in {location}".replace(" ", "+")
+            url = f"https://www.google.com/maps/search/{query}"
             
-            websites = list(dict.fromkeys(w for w in websites if 'google' not in w.lower()))
-            
-            seen = set()
-            for i, name in enumerate(names[:20]):
-                if name in seen: continue
-                seen.add(name)
-                website = websites[i] if i < len(websites) else 'N/A'
-                results.append({
-                    'Name': name,
-                    'Phone': phones[i] if i < len(phones) else 'N/A',
-                    'Website': website,
-                    'Rating': ratings[i] if i < len(ratings) else 'N/A',
-                    'Address': location,
-                    'Category': keyword,
-                    'Maps_Link': 'N/A'
-                })
-        except: pass
-        return results
+            jobs_dict[job_id]['status_text'] = f"Searching Maps for: {keyword}..."
+            page.goto(url, timeout=60000)
+            page.wait_for_timeout(3000) # Wait for initial load
+
+            # 1. Scroll the sidebar and collect business URLs
+            business_urls = []
+            try:
+                page.hover('a[href*="https://www.google.com/maps/place/"]')
+            except:
+                pass
+
+            scroll_attempts = 0
+            while len(business_urls) < max_leads and scroll_attempts < 15:
+                page.mouse.wheel(0, 5000)
+                page.wait_for_timeout(1500)
+                
+                links = page.locator('a[href*="https://www.google.com/maps/place/"]').all()
+                for link in links:
+                    href = link.get_attribute('href')
+                    if href and href not in business_urls:
+                        business_urls.append(href)
+                
+                # Check if we hit the end of the list
+                if page.locator("text=You've reached the end of the list").is_visible():
+                    break
+                scroll_attempts += 1
+
+            # 2. Visit each URL and extract detailed data
+            for url in business_urls:
+                current_leads = jobs_dict[job_id].get('leads', [])
+                if len(current_leads) >= max_leads:
+                    break
+                    
+                page.goto(url, timeout=60000)
+                page.wait_for_timeout(1500)
+                
+                # Extract Name
+                name = self.safe_extract(page, 'h1')
+                if name == "N/A" or name in seen_names:
+                    continue
+                    
+                jobs_dict[job_id]['status_text'] = f"Extracting data for: {name}..."
+                
+                # Extract Rating
+                rating_text = self.safe_extract(page, 'div.F7nice')
+                rating = "N/A"
+                if rating_text != "N/A" and "\n" in rating_text:
+                    rating = rating_text.split("\n")[0]
+                    
+                # Apply Rating Filter
+                if max_rating and rating != "N/A":
+                    try:
+                        if float(rating) > float(max_rating): continue
+                    except: pass
+
+                # Extract Phone & Website
+                phone = self.safe_extract(page, 'button[data-item-id^="phone:tel:"]', "innerText")
+                if phone != "N/A": phone = phone.replace("\u200e", "").strip()
+                
+                website = self.safe_extract(page, 'a[data-item-id="authority"]', "href")
+                
+                # Extract Email (Do not skip if missing, just mark as N/A to prevent freezing)
+                email = "N/A"
+                if website != "N/A":
+                    jobs_dict[job_id]['status_text'] = f"Hunting email for: {name}..."
+                    email = email_lib.get_email(website)
+                    
+                lead = {
+                    "Name": name,
+                    "Phone": phone,
+                    "Website": website,
+                    "Email": email,
+                    "Rating": rating,
+                    "Address": location,
+                    "Category": keyword,
+                    "Maps_Link": url
+                }
+                
+                seen_names.add(name)
+                
+                # Update global job state for real-time UI updates
+                current_leads.append(lead)
+                jobs_dict[job_id]['leads'] = current_leads
+                jobs_dict[job_id]['count'] = len(current_leads)
+                jobs_dict[job_id]['status_text'] = f"Found {len(current_leads)}/{max_leads} leads... (Latest: {name})"
+
+        except Exception as e:
+            print(f"Error scraping {keyword}: {e}")
+        finally:
+            page.close()
 
 # ══════════════════════════════════════════════
 #   2. DEEP EMAIL EXTRACTOR LIBRARY
@@ -267,87 +232,70 @@ def run_job_thread(job_id, data):
     try:
         location = data.get('location')
         base_keyword = data.get('keyword')
-        max_leads = min(int(data.get('max_leads', 10)), 200) # Max limit 200 enforced
+        max_leads = min(int(data.get('max_leads', 10)), 200)
         max_rating = data.get('max_rating')
         webhook_url = data.get('webhook_url')
         templates = data.get('templates', [])
         
-        maps_lib = GoogleMapsScraper()
         email_lib = DeepEmailExtractor()
         
-        final_leads = []
+        jobs[job_id] = {'status': 'scraping', 'count': 0, 'leads': [], 'status_text': 'Starting browser engine...'}
+        
         seen_names = set()
         used_keywords = set()
         pending_keywords = [base_keyword]
-        
-        jobs[job_id] = {'status': 'scraping', 'count': 0, 'status_text': 'Starting engine...'}
-        
         kw_attempts = 0
-        max_kw_attempts = 15 # Prevent infinite loops
+        max_kw_attempts = 10
         
-        # --- PHASE 1: SCRAPING (Target Guarantee) ---
-        while len(final_leads) < max_leads and kw_attempts < max_kw_attempts:
-            if not pending_keywords:
-                jobs[job_id]['status_text'] = f"Generating new keywords for '{base_keyword}'..."
-                new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
-                pending_keywords.extend(new_kws)
+        # Start Synchronous Playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080}
+            )
+            
+            # Block heavy resources for speed
+            context.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
+            
+            maps_scraper = GoogleMapsScraper(context)
+            
+            # --- PHASE 1: SCRAPING ---
+            while len(jobs[job_id]['leads']) < max_leads and kw_attempts < max_kw_attempts:
+                if not pending_keywords:
+                    jobs[job_id]['status_text'] = f"Generating new keywords for '{base_keyword}'..."
+                    new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
+                    pending_keywords.extend(new_kws)
+                    
+                current_kw = pending_keywords.pop(0)
+                used_keywords.add(current_kw.lower())
+                kw_attempts += 1
                 
-            current_kw = pending_keywords.pop(0)
-            used_keywords.add(current_kw.lower())
-            kw_attempts += 1
-            
-            start = 0
-            empty_strikes = 0
-            
-            while start <= 300 and len(final_leads) < max_leads:
-                jobs[job_id]['status_text'] = f"Found {len(final_leads)}/{max_leads} valid emails... (Searching: {current_kw})"
-                raw_batch = maps_lib.get_page(current_kw, location, start)
+                maps_scraper.scrape_keyword(
+                    keyword=current_kw, 
+                    location=location, 
+                    max_leads=max_leads, 
+                    seen_names=seen_names, 
+                    job_id=job_id, 
+                    jobs_dict=jobs, 
+                    email_lib=email_lib, 
+                    max_rating=max_rating
+                )
                 
-                if not raw_batch:
-                    empty_strikes += 1
-                    if empty_strikes >= 2: break
-                else:
-                    empty_strikes = 0
-                    
-                for lead in raw_batch:
-                    if len(final_leads) >= max_leads: break
-                    if lead['Name'] in seen_names: continue
-                    
-                    # LIVE UI UPDATE: Show exactly which company is being checked right now
-                    jobs[job_id]['status_text'] = f"Found {len(final_leads)}/{max_leads} valid emails... (Checking: {lead['Name']})"
-                    
-                    # Rating Filter (Bad Reviews)
-                    if max_rating and lead['Rating'] != "N/A":
-                        try:
-                            if float(lead['Rating']) > float(max_rating): continue
-                        except: continue
-                    
-                    # Strict Email Check
-                    if lead['Website'] == 'N/A': continue
-                    email = email_lib.get_email(lead['Website'])
-                    if email == "N/A": continue 
-                    
-                    lead['Email'] = email
-                    seen_names.add(lead['Name'])
-                    final_leads.append(lead)
-                    
-                    jobs[job_id]['count'] = len(final_leads)
-                    jobs[job_id]['leads'] = final_leads # Update live for UI
-                        
-                start += 20
-                time.sleep(1.5)
-            time.sleep(2)
+            browser.close()
             
-        jobs[job_id]['leads'] = final_leads
+        final_leads = jobs[job_id]['leads']
         
         # --- PHASE 2: AUTOMATED EMAIL SENDING ---
         if webhook_url and templates and len(final_leads) > 0:
             jobs[job_id]['status'] = 'sending_emails'
-            jobs[job_id]['total_to_send'] = len(final_leads)
+            jobs[job_id]['total_to_send'] = len([l for l in final_leads if l['Email'] != 'N/A'])
             emails_sent = 0
             
             for lead in final_leads:
-                jobs[job_id]['status_text'] = f"Sending personalized email {emails_sent+1}/{len(final_leads)} to {lead['Email']}..."
+                if lead['Email'] == 'N/A': continue
+                
+                jobs[job_id]['status_text'] = f"Sending personalized email {emails_sent+1}/{jobs[job_id]['total_to_send']} to {lead['Email']}..."
                 
                 template = random.choice(templates)
                 p_subject, p_body = personalize_email(lead['Name'], base_keyword, template['subject'], template['body'])
@@ -360,8 +308,7 @@ def run_job_thread(job_id, data):
                 except Exception as e:
                     print(f"Failed to send email to {lead['Email']}: {e}")
                 
-                # Anti-Spam Delay (60 to 120 seconds)
-                if emails_sent < len(final_leads):
+                if emails_sent < jobs[job_id]['total_to_send']:
                     delay = random.randint(60, 120)
                     for i in range(delay, 0, -1):
                         jobs[job_id]['status_text'] = f"Anti-Spam: Waiting {i}s before next email..."
@@ -436,7 +383,7 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
   <!-- STATS -->
   <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
     <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-white" id="st">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-users text-indigo-400 text-xs"></i>Total Leads</div></div>
-    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-emerald-400" id="se">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-envelope text-emerald-400 text-xs"></i>Emails</div></div>
+    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-emerald-400" id="se">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-envelope text-emerald-400 text-xs"></i>Emails Found</div></div>
     <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-sky-400" id="sp">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-phone text-sky-400 text-xs"></i>Phones</div></div>
     <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-violet-400" id="sw">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-globe text-violet-400 text-xs"></i>Websites</div></div>
   </div>
@@ -463,7 +410,7 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
         <div><label class="text-xs text-slate-500 mb-1.5 block">⭐ Max Rating (Optional - For Bad Reviews)</label><input id="m-rating" type="number" step="0.1" class="inp" placeholder="e.g. 3.5"></div>
       </div>
       <div class="p-3 mb-4 rounded-xl text-xs" style="background:rgba(239,68,68,0.07);border:1px solid rgba(239,68,68,0.2);color:#f87171">
-        <i class="fa-solid fa-shield-halved mr-1"></i> <b>Strict Mode:</b> Only valid emails are counted. AI will auto-expand keywords until target is reached.
+        <i class="fa-solid fa-shield-halved mr-1"></i> <b>Smart Mode:</b> Extracts all leads. AI will auto-expand keywords until target is reached.
       </div>
       <button onclick="startJob()" id="btn-run" class="btn-p w-full py-3 rounded-xl text-sm"><i class="fa-solid fa-play mr-2"></i>Start Scraping & Automation</button>
     </div>
@@ -633,9 +580,9 @@ function setSt(msg, state='load', pct=null){
 
 function updStats(leads){
   document.getElementById('st').textContent=leads.length;
-  document.getElementById('se').textContent=leads.length; // all have emails
+  document.getElementById('se').textContent=leads.filter(l=>l.Email&&l.Email!='N/A').length;
   document.getElementById('sp').textContent=leads.filter(l=>l.Phone&&l.Phone!='N/A').length;
-  document.getElementById('sw').textContent=leads.length;
+  document.getElementById('sw').textContent=leads.filter(l=>l.Website&&l.Website!='N/A').length;
 }
 
 function showPV(leads){
@@ -693,7 +640,6 @@ async function startJob(){
             
             if(d2.status==='scraping'){
                 setSt(d2.status_text, 'load', Math.max(5, (d2.count/count)*100));
-                // Update live UI if leads are found
                 if(d2.leads && d2.leads.length > 0) {
                     updStats(d2.leads);
                     if(!tableShown) { showPV(d2.leads); tableShown=true; }
@@ -705,7 +651,7 @@ async function startJob(){
                     updStats(d2.leads); showPV(d2.leads); tableShown = true;
                 }
                 document.getElementById('dlbtn').classList.remove('hidden');
-                let emailPct = (d2.emails_sent / d2.total_to_send) * 100;
+                let emailPct = d2.total_to_send > 0 ? (d2.emails_sent / d2.total_to_send) * 100 : 100;
                 setSt(d2.status_text, 'email', Math.max(5, emailPct));
                 setTimeout(poll, 3000);
             }
@@ -723,7 +669,7 @@ async function startJob(){
               setTimeout(poll, 3000);
             }
         } catch(e) {
-            setTimeout(poll, 3000); // Keep trying if network fails briefly
+            setTimeout(poll, 3000);
         }
       };
       setTimeout(poll, 2000);
@@ -790,7 +736,7 @@ bot_store = {}
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("🚀 Start Search", callback_data="start_manual")]]
-    await update.message.reply_text("👋 *LeadGen Pro Bot*\n\n✅ Strict Valid Emails\n✅ Auto AI Keyword Expansion\n✅ Max Limit: 200\n\n_Note: For Email Automation, please use the Web Dashboard._", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("👋 *LeadGen Pro Bot*\n\n✅ Smart Mode Extraction\n✅ Auto AI Keyword Expansion\n✅ Max Limit: 200\n\n_Note: For Email Automation, please use the Web Dashboard._", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
 
 async def handle_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -806,7 +752,7 @@ async def m_loc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def m_kw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot_store[update.message.from_user.id]['kw'] = update.message.text
-    await update.message.reply_text("🔢 Enter Target Number of Valid Emails (Max 200):")
+    await update.message.reply_text("🔢 Enter Target Number of Leads (Max 200):")
     return M_COUNT
 
 async def m_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -823,62 +769,65 @@ async def m_rating(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot_store[uid]['rating'] = None if txt == 'skip' else txt
     
     data = bot_store[uid]
-    txt_summary = f"📋 *Target Guarantee*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Target: {data['count']} Valid Emails\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nStart Scraping?"
+    txt_summary = f"📋 *Target Guarantee*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Target: {data['count']} Leads\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nStart Scraping?"
     kb = [[InlineKeyboardButton("✅ Start", callback_data="start_scrape")]]
     await update.message.reply_text(txt_summary, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
 
-async def background_bot_task(chat_id, message_id, data, bot):
-    try:
-        loop = asyncio.get_event_loop()
-        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="⏳ *Scraping & Deep Email Extraction running...*\n_AI will auto-expand keywords until target is reached._", parse_mode='Markdown')
+def run_bot_scrape_sync(data):
+    """Runs the synchronous Playwright scraper for the Telegram Bot."""
+    location = data['loc']
+    base_keyword = data['kw']
+    max_leads = data['count']
+    max_rating = data.get('rating')
+    
+    email_lib = DeepEmailExtractor()
+    seen_names = set()
+    used_keywords = set()
+    pending_keywords = [base_keyword]
+    kw_attempts = 0
+    
+    dummy_job_id = "bot_job"
+    dummy_jobs = {dummy_job_id: {'leads': [], 'status_text': ''}}
+    
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        context = browser.new_context(viewport={"width": 1920, "height": 1080})
+        context.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
         
-        maps_lib = GoogleMapsScraper()
-        email_lib = DeepEmailExtractor()
-        final_leads = []
-        seen_names = set()
-        used_keywords = set()
-        pending_keywords = [data['kw']]
-        max_leads = data['count']
-        kw_attempts = 0
+        maps_scraper = GoogleMapsScraper(context)
         
-        while len(final_leads) < max_leads and kw_attempts < 15:
+        while len(dummy_jobs[dummy_job_id]['leads']) < max_leads and kw_attempts < 10:
             if not pending_keywords:
-                new_kws = generate_ai_keywords(data['kw'], data['loc'], used_keywords)
+                new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
                 pending_keywords.extend(new_kws)
                 
             current_kw = pending_keywords.pop(0)
             used_keywords.add(current_kw.lower())
             kw_attempts += 1
             
-            start = 0
-            empty_strikes = 0
-            while start <= 300 and len(final_leads) < max_leads:
-                raw_batch = await loop.run_in_executor(None, maps_lib.get_page, current_kw, data['loc'], start)
-                if not raw_batch:
-                    empty_strikes += 1
-                    if empty_strikes >= 2: break
-                else:
-                    empty_strikes = 0
-                    
-                for lead in raw_batch:
-                    if len(final_leads) >= max_leads: break
-                    if lead['Name'] in seen_names: continue
-                    if data.get('rating') and lead['Rating'] != "N/A":
-                        try:
-                            if float(lead['Rating']) > float(data.get('rating')): continue
-                        except: continue
-                    if lead['Website'] == 'N/A': continue
-                    email = await loop.run_in_executor(None, email_lib.get_email, lead['Website'])
-                    if email == "N/A": continue
-                    
-                    lead['Email'] = email
-                    seen_names.add(lead['Name'])
-                    final_leads.append(lead)
-                start += 20
-                await asyncio.sleep(1.5)
-            await asyncio.sleep(2)
-            
+            maps_scraper.scrape_keyword(
+                keyword=current_kw, 
+                location=location, 
+                max_leads=max_leads, 
+                seen_names=seen_names, 
+                job_id=dummy_job_id, 
+                jobs_dict=dummy_jobs, 
+                email_lib=email_lib, 
+                max_rating=max_rating
+            )
+        browser.close()
+        
+    return dummy_jobs[dummy_job_id]['leads']
+
+async def background_bot_task(chat_id, message_id, data, bot):
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="⏳ *Scraping & Deep Email Extraction running...*\n_AI will auto-expand keywords until target is reached._", parse_mode='Markdown')
+        
+        # Run the synchronous scraper in a separate thread to avoid blocking the Telegram event loop
+        loop = asyncio.get_event_loop()
+        final_leads = await loop.run_in_executor(None, run_bot_scrape_sync, data)
+        
         if not final_leads:
             await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="😔 No results found.")
             return
@@ -888,7 +837,7 @@ async def background_bot_task(chat_id, message_id, data, bot):
         with open(path, 'rb') as f:
             await bot.send_document(
                 chat_id=chat_id, document=f, filename=f"Target_Leads.csv",
-                caption=f"🎯 *Target Reached!*\n📊 Total Valid Emails: {len(final_leads)}", parse_mode='Markdown'
+                caption=f"🎯 *Target Reached!*\n📊 Total Leads: {len(final_leads)}", parse_mode='Markdown'
             )
         os.unlink(path)
     except Exception as e:
