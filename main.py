@@ -12,25 +12,23 @@ from telegram.ext import (
 
 load_dotenv()
 
-CONFIG = {
-    "TELEGRAM_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN"),
-    "GROQ_API_KEY": os.getenv("GROQ_API_KEY", "")
-}
+# ==========================================
+# ⚙️ CONFIGURATION (Set in .env or Render)
+# ==========================================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") # Ensure this is set in Render Environment Variables
 
 # ══════════════════════════════════════════════
 #   1. PURE PYTHON GOOGLE MAPS LIBRARY
 # ══════════════════════════════════════════════
 class GoogleMapsScraper:
-    """
-    Fetches raw pages from Google Local Search.
-    """
     def __init__(self):
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9"
         }
 
-    def get_page(self, keyword, location, start, max_rating=None):
+    def get_page(self, keyword, location, start):
         results = []
         query = urllib.parse.quote(f"{keyword} in {location}")
         url = f"https://www.google.com/search?q={query}&tbm=lcl&start={start}"
@@ -39,34 +37,24 @@ class GoogleMapsScraper:
             res = requests.get(url, headers=self.headers, timeout=15)
             soup = BeautifulSoup(res.text, 'html.parser')
             
-            # Find all business blocks
             places = soup.find_all('div', class_=['VkpGBb', 'rllt__details', 'dbg0pd'])
-            
-            if not places:
-                return []
+            if not places: return []
                 
             for place in places:
-                # Extract Name
                 name_tag = place.find(['div', 'h3', 'span'], class_='dbg0pd') or place.find('div', role='heading')
                 name = name_tag.get_text(strip=True) if name_tag else "N/A"
                 
-                if name == "N/A" or len(name) < 3:
-                    continue
+                if name == "N/A" or len(name) < 3: continue
                     
                 text_content = place.get_text(separator=' ', strip=True)
                 
-                # Extract Rating
-                rating_match = re.search(r'(\d\.\d)\s*\(', text_content)
-                rating = rating_match.group(1) if rating_match else "N/A"
+                # Robust Rating Extraction
+                rating_match = re.search(r'(\d[\.,]\d)\s*(?:\(|stars|reviews)', text_content)
+                rating = rating_match.group(1).replace(',', '.') if rating_match else "N/A"
                 
-                if max_rating and rating != "N/A" and float(rating) > float(max_rating):
-                    continue
-                    
-                # Extract Phone
                 phone_match = re.search(r'(\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}', text_content)
                 phone = phone_match.group(0) if phone_match else "N/A"
                 
-                # Extract Website
                 website = "N/A"
                 for a in place.find_all('a', href=True):
                     href = a['href']
@@ -102,114 +90,128 @@ class DeepEmailExtractor:
     def get_email(self, url):
         if not url or url == "N/A": return "N/A"
         if not url.startswith('http'): url = 'http://' + url
-        
         try:
             r = requests.get(url, headers=self.headers, timeout=8, verify=False)
             emails = list(set(re.findall(self.email_regex, r.text)))
-            valid_emails = [e for e in emails if not any(x in e.lower() for x in ['example', 'domain', 'sentry', '@2x', '.png', '.jpg'])]
-            if valid_emails: return valid_emails[0]
+            valid = [e for e in emails if not any(x in e.lower() for x in ['example','domain','sentry','@2x','.png','.jpg','wixpress'])]
+            if valid: return valid[0]
             
-            # Try contact page
             soup = BeautifulSoup(r.text, 'html.parser')
             for a in soup.find_all('a', href=True):
                 if 'contact' in a.get('href', '').lower():
-                    contact_link = urllib.parse.urljoin(url, a['href'])
-                    r2 = requests.get(contact_link, headers=self.headers, timeout=8, verify=False)
+                    clink = urllib.parse.urljoin(url, a['href'])
+                    r2 = requests.get(clink, headers=self.headers, timeout=8, verify=False)
                     emails2 = list(set(re.findall(self.email_regex, r2.text)))
-                    valid_emails2 = [e for e in emails2 if not any(x in e.lower() for x in ['example', 'domain', 'sentry', '@2x'])]
-                    if valid_emails2: return valid_emails2[0]
-        except:
-            pass
+                    valid2 = [e for e in emails2 if not any(x in e.lower() for x in ['example','domain','sentry','@2x','.png','.jpg'])]
+                    if valid2: return valid2[0]
+        except: pass
         return "N/A"
 
 # ══════════════════════════════════════════════
-#   3. MASTER EXECUTION FUNCTION (Target Guarantee Engine)
+#   3. AI KEYWORD GENERATOR
 # ══════════════════════════════════════════════
-def run_full_scraper(location, keyword, max_leads=50, max_rating=None):
+def generate_ai_keywords(base_kw, location, used_kws):
+    if not GROQ_API_KEY: return []
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        prompt = f"""
+        I am scraping Google Maps for '{base_kw}' in '{location}'.
+        I have already used these keywords: {list(used_kws)}.
+        Generate 10 NEW, highly related search terms/categories to find similar businesses.
+        Return ONLY a comma-separated list of keywords. No extra text.
+        Example: dental clinic, orthodontist, teeth whitening service, oral surgeon
+        """
+        res = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama3-8b-8192",
+            temperature=0.7,
+        )
+        text = res.choices[0].message.content
+        new_kws = [k.strip() for k in text.split(',') if k.strip() and k.strip().lower() not in used_kws]
+        return new_kws
+    except Exception as e:
+        print(f"AI Keyword Gen Error: {e}")
+        return []
+
+# ══════════════════════════════════════════════
+#   4. MASTER EXECUTION FUNCTION (Target + Email Guarantee)
+# ══════════════════════════════════════════════
+def run_full_scraper(job_id, location, base_keyword, max_leads=50, max_rating=None):
     maps_lib = GoogleMapsScraper()
     email_lib = DeepEmailExtractor()
     
     final_leads = []
     seen_names = set()
-    start = 0
-    empty_strikes = 0
+    used_keywords = set()
+    pending_keywords = [base_keyword]
     max_leads = int(max_leads)
     
-    # এটি লুপ করতে থাকবে যতক্ষণ না লিমিট পূরণ হয় (অথবা ৮০০ রেজাল্ট পর্যন্ত)
-    while len(final_leads) < max_leads and start <= 800:
-        raw_batch = maps_lib.get_page(keyword, location, start, max_rating)
-        
-        if not raw_batch:
-            empty_strikes += 1
-            if empty_strikes >= 3:
-                break # গুগলের কাছে আর ডাটা নেই
-        else:
-            empty_strikes = 0
+    while len(final_leads) < max_leads:
+        # If we run out of keywords, ask AI for more
+        if not pending_keywords:
+            if job_id in jobs: jobs[job_id]['status_text'] = f"AI is generating new keywords related to '{base_keyword}'..."
+            new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
+            if not new_kws: break # AI failed or exhausted
+            pending_keywords.extend(new_kws)
             
-        for lead in raw_batch:
-            if len(final_leads) >= max_leads:
-                break
-                
-            if lead['Name'] in seen_names:
-                continue
-                
-            # Enrich Email on the fly
-            if lead['Website'] != 'N/A':
-                lead['Email'] = email_lib.get_email(lead['Website'])
+        current_kw = pending_keywords.pop(0)
+        used_keywords.add(current_kw.lower())
+        
+        if job_id in jobs: jobs[job_id]['status_text'] = f"Scraping keyword: '{current_kw}'..."
+        
+        start = 0
+        empty_strikes = 0
+        
+        # Scrape pages for the current keyword
+        while start <= 300 and len(final_leads) < max_leads:
+            raw_batch = maps_lib.get_page(current_kw, location, start)
+            
+            if not raw_batch:
+                empty_strikes += 1
+                if empty_strikes >= 2: break # End of results for this keyword
             else:
-                lead['Email'] = "N/A"
+                empty_strikes = 0
                 
-            # Quality Check: Keep only if it has Phone or Email or Website
-            if lead['Phone'] != 'N/A' or lead['Email'] != 'N/A' or lead['Website'] != 'N/A':
+            for lead in raw_batch:
+                if len(final_leads) >= max_leads: break
+                if lead['Name'] in seen_names: continue
+                
+                # 1. RATING FILTER (Focus on Bad Ratings if provided)
+                if max_rating:
+                    if lead['Rating'] == "N/A": continue
+                    try:
+                        if float(lead['Rating']) > float(max_rating): continue
+                    except: continue # Skip if conversion fails
+                
+                # 2. STRICT EMAIL FILTER
+                if lead['Website'] == 'N/A': continue # No website = No email
+                email = email_lib.get_email(lead['Website'])
+                
+                if email == "N/A": continue # REJECT LEAD IF NO EMAIL
+                
+                # Lead is Valid!
+                lead['Email'] = email
                 seen_names.add(lead['Name'])
                 final_leads.append(lead)
                 
-        start += 20
-        time.sleep(1.5) # Anti-block delay between page requests
+                # Update progress live
+                if job_id in jobs:
+                    jobs[job_id]['count'] = len(final_leads)
+                    jobs[job_id]['status_text'] = f"Found {len(final_leads)}/{max_leads} valid emails... (Searching: {current_kw})"
+                    
+            start += 20
+            time.sleep(1.5) # Anti-block delay
+            
+        time.sleep(2) # Delay before switching keyword
         
     return final_leads
 
 # ══════════════════════════════════════════════
-#   GROQ AI BRAIN
-# ══════════════════════════════════════════════
-def parse_with_ai(user_text):
-    if not CONFIG["GROQ_API_KEY"]:
-        raise Exception("Groq API Key is missing! Please add it in settings.")
-    
-    client = Groq(api_key=CONFIG["GROQ_API_KEY"])
-    prompt = f"""
-    You are an AI assistant for a Lead Generation tool.
-    Extract the following details from the user's input:
-    - loc: The location (e.g., Vancouver, Dhaka, Texas)
-    - kw: The niche or keyword (e.g., car showroom, plumber)
-    - count: Number of leads requested (integer, default is 50)
-    - rating: Maximum rating requested (float, e.g., 3.0, 4.5)
-
-    User input: "{user_text}"
-
-    Return ONLY a valid JSON object. Do not include any other text.
-    Example format: {{"loc": "Vancouver", "kw": "car showroom", "count": 50, "rating": 3.0}}
-    """
-    try:
-        chat_completion = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama3-8b-8192",
-            temperature=0,
-        )
-        response = chat_completion.choices[0].message.content
-        json_match = re.search(r'\{.*\}', response, re.DOTALL)
-        if json_match: return json.loads(json_match.group(0))
-        return json.loads(response)
-    except Exception as e:
-        raise Exception("Failed to connect to Groq AI. Check API Key.")
-
-# ══════════════════════════════════════════════
-#   WEB DASHBOARD (FLASK + DARK UI)
+#   FLASK DASHBOARD & API
 # ══════════════════════════════════════════════
 flask_app = Flask(__name__)
 jobs = {}
 
-# New UI HTML exactly as requested
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -276,11 +278,6 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
     <span class="pill pb text-xs" id="today-badge">
       <i class="fa-solid fa-bolt mr-1 text-xs"></i><span id="tn">0</span> today
     </span>
-    <button onclick="showTab('settings')"
-      class="w-9 h-9 rounded-xl flex items-center justify-center"
-      style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06)">
-      <i class="fa-solid fa-gear text-slate-400 text-sm"></i>
-    </button>
   </div>
 </nav>
 
@@ -297,9 +294,7 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
   <!-- TABS -->
   <div class="flex gap-2 mb-5 overflow-x-auto pb-1">
     <button class="tab on" id="tab-manual" onclick="showTab('manual')"><i class="fa-solid fa-sliders mr-1.5"></i>Manual</button>
-    <button class="tab" id="tab-ai" onclick="showTab('ai')"><i class="fa-solid fa-robot mr-1.5"></i>AI Agent</button>
     <button class="tab" id="tab-history" onclick="showTab('history')"><i class="fa-solid fa-clock-rotate-left mr-1.5"></i>History</button>
-    <button class="tab" id="tab-settings" onclick="showTab('settings')"><i class="fa-solid fa-gear mr-1.5"></i>Settings</button>
   </div>
 
   <!-- MANUAL PANE -->
@@ -312,20 +307,23 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-5">
         <div>
           <label class="text-xs text-slate-500 mb-1.5 block">📍 Location *</label>
-          <input id="m-loc" class="inp" placeholder="e.g. Vancouver, Canada">
+          <input id="m-loc" class="inp" placeholder="e.g. new york">
         </div>
         <div>
           <label class="text-xs text-slate-500 mb-1.5 block">🔍 Keyword *</label>
-          <input id="m-kw" class="inp" placeholder="e.g. car showroom">
+          <input id="m-kw" class="inp" placeholder="e.g. dentist">
         </div>
         <div>
-          <label class="text-xs text-slate-500 mb-1.5 block">🔢 Exact Number of Leads</label>
-          <input id="m-count" type="number" value="50" class="inp">
+          <label class="text-xs text-slate-500 mb-1.5 block">🔢 Exact Number of Valid Emails</label>
+          <input id="m-count" type="number" value="100" class="inp">
         </div>
         <div>
-          <label class="text-xs text-slate-500 mb-1.5 block">⭐ Max Rating (Optional)</label>
-          <input id="m-rating" type="number" step="0.1" class="inp" placeholder="e.g. 4.0">
+          <label class="text-xs text-slate-500 mb-1.5 block">⭐ Max Rating (Optional - For Bad Reviews)</label>
+          <input id="m-rating" type="number" step="0.1" class="inp" placeholder="e.g. 3.5">
         </div>
+      </div>
+      <div class="p-3 mb-4 rounded-xl text-xs" style="background:rgba(239,68,68,0.07);border:1px solid rgba(239,68,68,0.2);color:#f87171">
+        <i class="fa-solid fa-triangle-exclamation mr-1"></i> <b>Strict Mode:</b> শুধুমাত্র Valid Email পাওয়া গেলেই লিড কাউন্ট হবে। টার্গেট পূরণ না হওয়া পর্যন্ত AI নতুন কিওয়ার্ড দিয়ে খুঁজতে থাকবে।
       </div>
       <button onclick="startManual()" id="btn-run" class="btn-p w-full py-3 rounded-xl text-sm">
         <i class="fa-solid fa-rocket mr-2"></i>Start Scraping
@@ -365,37 +363,6 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
     </div>
   </div>
 
-  <!-- AI PANE -->
-  <div id="pane-ai" class="hidden fade">
-    <div class="card overflow-hidden flex flex-col" style="height:550px">
-      <div class="px-5 py-4 flex items-center gap-3"
-           style="background:rgba(79,70,229,0.07);border-bottom:1px solid rgba(79,70,229,0.13)">
-        <div class="btn-p w-9 h-9 rounded-xl flex items-center justify-center text-xs">
-          <i class="fa-solid fa-robot"></i>
-        </div>
-        <div>
-          <div class="font-bold text-white text-sm">AI Lead Agent</div>
-          <div class="text-xs text-emerald-400 flex items-center gap-1">
-            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 blink"></span>Groq Powered
-          </div>
-        </div>
-      </div>
-      <div id="cbox" class="flex-1 overflow-y-auto p-5 space-y-3" style="background:rgba(0,0,0,0.25)">
-        <div class="chat-bot fade">
-          👋 Hi! Tell me what leads you need.<br><br>
-          <span style="color:#818cf8;font-style:italic">"Find 100 car showrooms in Vancouver, max rating 3.5"</span>
-        </div>
-      </div>
-      <div class="p-4 flex gap-2" style="border-top:1px solid rgba(79,70,229,0.1)">
-        <input id="ai-inp" class="inp flex-1" placeholder="Type your request..."
-               onkeypress="if(event.key==='Enter')sendAI()">
-        <button onclick="sendAI()" class="btn-p w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0 text-sm">
-          <i class="fa-solid fa-paper-plane"></i>
-        </button>
-      </div>
-    </div>
-  </div>
-
   <!-- HISTORY PANE -->
   <div id="pane-history" class="hidden fade">
     <div class="card p-6">
@@ -413,55 +380,22 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
     </div>
   </div>
 
-  <!-- SETTINGS PANE -->
-  <div id="pane-settings" class="hidden fade">
-    <div class="card p-6 space-y-5">
-      <h2 class="font-bold text-white text-sm flex items-center gap-2">
-        <i class="fa-solid fa-gear text-slate-400 text-xs"></i>Settings
-      </h2>
-      <div class="p-4 rounded-xl text-xs"
-           style="background:rgba(5,150,105,0.07);border:1px solid rgba(5,150,105,0.2);color:#34d399">
-        <i class="fa-solid fa-check-circle mr-2"></i>Pure Python engine — no API key needed for scraping
-      </div>
-      <div>
-        <label class="text-xs text-slate-500 mb-1.5 block">Groq API Key (AI Agent এর জন্য)</label>
-        <input id="gk" type="password" class="inp" placeholder="gsk_...">
-        <p class="text-xs text-slate-600 mt-1.5">
-          Free: <a href="https://console.groq.com/keys" target="_blank" style="color:#818cf8">console.groq.com</a>
-        </p>
-      </div>
-      <button onclick="saveS()" class="btn-p w-full py-3 rounded-xl text-sm">
-        <i class="fa-solid fa-floppy-disk mr-2"></i>Save
-      </button>
-      <div id="sok" class="hidden text-center text-xs text-emerald-400">✅ Saved!</div>
-    </div>
-  </div>
-
 </div>
 
 <script>
-let jid=null, aiSt={}, hist=[], today=0;
+let jid=null, hist=[], today=0;
 
 window.onload=()=>{
-  const k=localStorage.getItem('gk'); if(k) document.getElementById('gk').value=k;
   hist=JSON.parse(localStorage.getItem('lh')||'[]'); renderH();
 };
 
 function showTab(t){
-  ['manual','ai','history','settings'].forEach(x=>{
+  ['manual','history'].forEach(x=>{
     document.getElementById('pane-'+x).classList.add('hidden');
     const b=document.getElementById('tab-'+x); if(b) b.classList.remove('on');
   });
   document.getElementById('pane-'+t).classList.remove('hidden');
   const ab=document.getElementById('tab-'+t); if(ab) ab.classList.add('on');
-}
-
-function saveS(){
-  const k=document.getElementById('gk').value.trim();
-  if(!k){alert('Key দাও!');return;}
-  localStorage.setItem('gk',k);
-  fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({groq:k})});
-  const el=document.getElementById('sok'); el.classList.remove('hidden'); setTimeout(()=>el.classList.add('hidden'),2000);
 }
 
 function setSt(msg,state='load',pct=null){
@@ -474,16 +408,16 @@ function setSt(msg,state='load',pct=null){
   if(pct!=null) document.getElementById('sbar').style.width=pct+'%';
 }
 
-function updStats(leads, eCount, pCount, wCount){
+function updStats(leads){
   document.getElementById('st').textContent=leads.length;
-  document.getElementById('se').textContent=eCount;
-  document.getElementById('sp').textContent=pCount;
-  document.getElementById('sw').textContent=wCount;
+  document.getElementById('se').textContent=leads.length; // because all have emails now
+  document.getElementById('sp').textContent=leads.filter(l=>l.Phone&&l.Phone!='N/A').length;
+  document.getElementById('sw').textContent=leads.length;
   today+=leads.length; document.getElementById('tn').textContent=today;
 }
 
 async function startJob(payload){
-  setSt('Scraping শুরু হয়েছে (Target পূরণ না হওয়া পর্যন্ত খুঁজবে)...','load',6);
+  setSt('Initializing...','load',5);
   document.getElementById('dlbtn').classList.add('hidden');
   document.getElementById('pvbox').classList.add('hidden');
   document.getElementById('sdet').textContent='';
@@ -494,25 +428,29 @@ async function startJob(payload){
   if(d.error){setSt(d.error,'err');if(btn)btn.disabled=false;return;}
   jid=d.job_id;
 
-  let pct=6;
-  const iv=setInterval(()=>{pct=Math.min(pct+3,87);document.getElementById('sbar').style.width=pct+'%';},8000);
-
   const poll=async()=>{
     const r2=await fetch('/api/status/'+jid); const d2=await r2.json();
-    if(d2.status==='done'){
-      clearInterval(iv); if(btn) btn.disabled=false;
-      setSt(`✅ সম্পন্ন — ${d2.count} leads found`,'done',100);
-      document.getElementById('sdet').textContent=`📧 ${d2.emails} email · 📞 ${d2.phones} phone · 🌐 ${d2.websites} website`;
+    
+    if(d2.status==='running'){
+        setSt(d2.status_text || 'Scraping and verifying emails...', 'load');
+        let progress = (d2.count / payload.max_leads) * 100;
+        document.getElementById('sbar').style.width = Math.max(5, progress) + '%';
+        setTimeout(poll, 4000);
+    }
+    else if(d2.status==='done'){
+      if(btn) btn.disabled=false;
+      setSt(`✅ সম্পন্ন — ${d2.count} valid email leads found!`,'done',100);
+      document.getElementById('sdet').textContent=`All leads have verified emails.`;
       document.getElementById('dlbtn').classList.remove('hidden');
-      updStats(d2.leads||[], d2.emails, d2.phones, d2.websites);
+      updStats(d2.leads||[]);
       showPV(d2.leads||[]);
       addH(payload.location,payload.keyword,d2.count);
     } else if(d2.status==='error'){
-      clearInterval(iv); if(btn) btn.disabled=false;
+      if(btn) btn.disabled=false;
       setSt('Error: '+d2.error,'err');
-    } else { setTimeout(poll,6000); }
+    }
   };
-  setTimeout(poll,4000);
+  setTimeout(poll,3000);
 }
 
 function startManual(){
@@ -522,7 +460,7 @@ function startManual(){
   startJob({
       location: loc, 
       keyword: kw, 
-      max_leads: parseInt(document.getElementById('m-count').value)||50,
+      max_leads: parseInt(document.getElementById('m-count').value)||100,
       max_rating: document.getElementById('m-rating').value || null
   });
 }
@@ -553,35 +491,12 @@ function renderH(){
     <div class="p-4 rounded-xl flex items-center justify-between fade" style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.05)">
       <div>
         <div class="text-sm font-semibold text-white">📍 ${h.loc} · 🔍 ${h.kw}</div>
-        <div class="text-xs text-slate-500 mt-1">📊 ${h.count} leads · ${h.t}</div>
+        <div class="text-xs text-slate-500 mt-1">📊 ${h.count} valid emails · ${h.t}</div>
       </div>
       <button onclick="rerun(${i})" class="btn-p px-3 py-1.5 rounded-lg text-xs"><i class="fa-solid fa-redo mr-1"></i>Re-run</button>
     </div>`).join('');
 }
-function rerun(i){ const h=hist[i]; document.getElementById('m-loc').value=h.loc; document.getElementById('m-kw').value=h.kw; showTab('manual'); startJob({location:h.loc,keyword:h.kw,max_leads:h.count}); }
-
-// AI
-function addM(html,isU=false){ const box=document.getElementById('cbox'); const d=document.createElement('div'); d.className=(isU?'chat-user':'chat-bot')+' fade'; d.innerHTML=html; box.appendChild(d); box.scrollTop=99999; return d; }
-
-async function sendAI(){
-  const inp=document.getElementById('ai-inp'); const text=inp.value.trim(); if(!text) return;
-  const key=localStorage.getItem('gk');
-  addM(text.replace(/</g,'&lt;'),true); inp.value='';
-  const ld=addM('<i class="fa-solid fa-ellipsis blink"></i>');
-  const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,state:aiSt})});
-  const d=await r.json(); ld.remove();
-  if(d.error){addM('❌ '+d.error);return;}
-  if(d.ready){
-    aiSt=d.state;
-    let stHTML = `Got it! 🎯<br><br>📍 <b>${d.state.loc}</b> · 🔍 <b>${d.state.kw}</b> · 🔢 <b>${d.state.count} leads</b>`;
-    if(d.state.rating) stHTML += ` · ⭐ Max ${d.state.rating}`;
-    
-    addM(`${stHTML}<br><br>
-      <button onclick="startJob({location:'${d.state.loc}',keyword:'${d.state.kw}',max_leads:${d.state.count},max_rating:'${d.state.rating||''}'});showTab('manual')"
-        style="margin-top:10px;padding:8px 18px;border-radius:9px;font-size:12px;font-weight:700;cursor:pointer;background:linear-gradient(135deg,#059669,#0d9488);color:white">
-        🚀 Start Engine</button>`);
-  } else { addM(d.reply); }
-}
+function rerun(i){ const h=hist[i]; document.getElementById('m-loc').value=h.loc; document.getElementById('m-kw').value=h.kw; startJob({location:h.loc,keyword:h.kw,max_leads:h.count}); }
 </script>
 </body>
 </html>"""
@@ -590,55 +505,20 @@ async function sendAI(){
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@flask_app.route('/api/settings', methods=['POST'])
-def update_settings():
-    if request.json.get('groq'): CONFIG["GROQ_API_KEY"] = request.json.get('groq')
-    return jsonify({"success": True})
-
-@flask_app.route('/api/chat', methods=['POST'])
-def handle_chat():
-    text = request.json.get('text')
-    if text.lower() in ['yes', 'start', 'do it', 'go']:
-        return jsonify({"ready": True, "state": request.json.get('state')})
-
-    try:
-        parsed = parse_with_ai(text)
-    except Exception as e:
-        return jsonify({"error": str(e)})
-    
-    if not parsed:
-        return jsonify({"error": "Failed to parse input. Try again."})
-
-    state = request.json.get('state', {})
-    if parsed.get('loc'): state['loc'] = parsed['loc']
-    if parsed.get('kw'): state['kw'] = parsed['kw']
-    if parsed.get('count'): state['count'] = parsed['count']
-    if parsed.get('rating'): state['rating'] = parsed['rating']
-
-    if not state.get('loc') or not state.get('kw'):
-        reply = "I still need a bit more info. "
-        if not state.get('loc'): reply += "Which **location** are you targeting? "
-        if not state.get('kw'): reply += "What **keyword or niche** are you looking for?"
-        return jsonify({"ready": False, "reply": reply})
-    
-    return jsonify({"ready": True, "state": state})
-
 def run_scrape_thread(job_id, data):
     try:
-        jobs[job_id] = {'status': 'running'}
+        jobs[job_id] = {'status': 'running', 'count': 0, 'status_text': 'Starting engine...'}
         leads = run_full_scraper(
+            job_id,
             data.get('location'), 
             data.get('keyword'),
-            data.get('max_leads', 50),
+            data.get('max_leads', 100),
             data.get('max_rating')
         )
         jobs[job_id] = {
             'status': 'done', 
             'leads': leads, 
-            'count': len(leads),
-            'emails': sum(1 for l in leads if l.get('Email', 'N/A') != 'N/A'),
-            'phones': sum(1 for l in leads if l.get('Phone', 'N/A') != 'N/A'),
-            'websites': sum(1 for l in leads if l.get('Website', 'N/A') != 'N/A')
+            'count': len(leads)
         }
     except Exception as e:
         jobs[job_id] = {'status': 'error', 'error': str(e)}
@@ -657,7 +537,7 @@ def status(job_id):
     job = jobs.get(job_id, {'status': 'not_found'})
     out = dict(job)
     if out.get('status') == 'done':
-        out['leads'] = job.get('leads', [])[:10] # send only top 10 for preview
+        out['leads'] = job.get('leads', [])[:10]
     return jsonify(out)
 
 @flask_app.route('/api/download/<job_id>')
@@ -672,10 +552,10 @@ def download(job_id):
     writer.writeheader()
     writer.writerows(leads)
     out.seek(0)
-    return send_file(io.BytesIO(out.getvalue().encode('utf-8-sig')), mimetype='text/csv', as_attachment=True, download_name='Target_Leads.csv')
+    return send_file(io.BytesIO(out.getvalue().encode('utf-8-sig')), mimetype='text/csv', as_attachment=True, download_name='Strict_Email_Leads.csv')
 
 # ══════════════════════════════════════════════
-#   TELEGRAM BOT
+#   TELEGRAM BOT (Simplified for strict mode)
 # ══════════════════════════════════════════════
 def to_csv(leads):
     tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8-sig', newline='')
@@ -686,78 +566,44 @@ def to_csv(leads):
     tmp.close()
     return tmp.name
 
-M_LOC, M_KW, M_COUNT, M_RATING, AI_PROMPT = range(5)
+M_LOC, M_KW, M_COUNT, M_RATING = range(4)
 bot_store = {}
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [InlineKeyboardButton("🛠️ Manual Search", callback_data="mode_manual")],
-        [InlineKeyboardButton("🤖 Groq AI Search", callback_data="mode_ai")]
-    ]
-    await update.message.reply_text("👋 *Pro Lead Gen Bot (Target Guarantee Engine)*\n\nকীভাবে সার্চ করতে চাও?", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    kb = [[InlineKeyboardButton("🚀 Start Strict Email Search", callback_data="start_manual")]]
+    await update.message.reply_text("👋 *LeadGen Pro (Strict Mode)*\n\n✅ Only Valid Emails\n✅ Auto Keyword Expansion\n✅ Bad Rating Filter", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
 
 async def handle_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    uid = q.from_user.id
-    bot_store[uid] = {}
-    
-    if q.data == "mode_manual":
-        await q.edit_message_text("📍 *Manual Mode*\nLocation দাও (e.g. Vancouver):", parse_mode='Markdown')
-        return M_LOC
-    else:
-        await q.edit_message_text("🤖 *Groq AI Mode*\nআমাকে ইংরেজিতে বলো তুমি কী খুঁজছো।\n\n_Example: I need 100 leads for car showrooms in Vancouver with maximum 3 star rating_", parse_mode='Markdown')
-        return AI_PROMPT
+    bot_store[q.from_user.id] = {}
+    await q.edit_message_text("📍 Location দাও (e.g. New York):")
+    return M_LOC
 
 async def m_loc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot_store[update.message.from_user.id]['loc'] = update.message.text
-    await update.message.reply_text("🔍 Keyword দাও (e.g. restaurant):")
+    await update.message.reply_text("🔍 Keyword দাও (e.g. dentist):")
     return M_KW
 
 async def m_kw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot_store[update.message.from_user.id]['kw'] = update.message.text
-    await update.message.reply_text("🔢 কয়টা লিড লাগবে? (e.g. 100):")
+    await update.message.reply_text("🔢 কয়টা Valid Email লিড লাগবে? (e.g. 100):")
     return M_COUNT
 
 async def m_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot_store[update.message.from_user.id]['count'] = update.message.text
-    await update.message.reply_text("⭐ Max Rating ফিল্টার করবে? (না চাইলে 'skip' লেখো):")
+    await update.message.reply_text("⭐ Max Rating ফিল্টার করবে? (না চাইলে 'skip' লেখো, e.g. 3.5):")
     return M_RATING
 
 async def m_rating(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.lower()
     uid = update.message.from_user.id
     bot_store[uid]['rating'] = None if txt == 'skip' else txt
-    return await ask_confirm(update, uid)
-
-async def ai_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    uid = update.message.from_user.id
-    msg = await update.message.reply_text("🤖 _Thinking..._", parse_mode='Markdown')
     
-    try:
-        parsed = parse_with_ai(text)
-        if not parsed.get('loc') or not parsed.get('kw'):
-            await msg.edit_text("🤖 আমি ঠিক বুঝতে পারিনি। দয়া করে Keyword এবং Location পরিষ্কার করে বলো।")
-            return AI_PROMPT
-            
-        bot_store[uid] = {
-            'loc': parsed['loc'],
-            'kw': parsed['kw'],
-            'count': parsed.get('count', 50),
-            'rating': parsed.get('rating')
-        }
-        await msg.delete()
-        return await ask_confirm(update, uid)
-    except Exception as e:
-        await msg.edit_text(f"❌ {str(e)}")
-        return AI_PROMPT
-
-async def ask_confirm(update, uid):
     data = bot_store[uid]
-    txt = f"📋 *Target Guarantee Engine*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Exact Target: {data['count']}\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nশুরু করবো?"
+    txt_summary = f"📋 *Target Guarantee*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Exact Target: {data['count']} Valid Emails\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nশুরু করবো?"
     kb = [[InlineKeyboardButton("✅ Start Automation", callback_data="start_scrape")]]
-    await update.message.reply_text(txt, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text(txt_summary, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
 
 async def execute_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -766,24 +612,22 @@ async def execute_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     data = bot_store.get(uid)
     
-    msg = await q.edit_message_text("⏳ *Scraping & Deep Email Extraction চলছে...*\n_টার্গেট পূরণ না হওয়া পর্যন্ত খুঁজতে থাকবে_", parse_mode='Markdown')
+    msg = await q.edit_message_text("⏳ *Scraping & Deep Email Extraction চলছে...*\n_টার্গেট পূরণ না হওয়া পর্যন্ত AI নতুন কিওয়ার্ড দিয়ে খুঁজতে থাকবে_", parse_mode='Markdown')
     
     try:
         loop = asyncio.get_event_loop()
-        leads = await loop.run_in_executor(None, run_full_scraper, data['loc'], data['kw'], data['count'], data.get('rating'))
+        # Using a dummy job_id for bot
+        leads = await loop.run_in_executor(None, run_full_scraper, "bot_job", data['loc'], data['kw'], data['count'], data.get('rating'))
         
         if not leads:
-            return await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text="😔 কোনো result নেই। দয়া করে দেশের নামের বদলে নির্দিষ্ট শহরের নাম দিয়ে সার্চ করো।")
+            return await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text="😔 কোনো result নেই।")
 
         path = to_csv(leads)
-        em = sum(1 for l in leads if str(l.get('Email','')) not in ('N/A','','None'))
-        ph = sum(1 for l in leads if str(l.get('Phone','')) not in ('N/A','','None'))
-        
         await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text="✅ হয়ে গেছে! ফাইল পাঠাচ্ছি...")
         with open(path, 'rb') as f:
             await ctx.bot.send_document(
-                chat_id=q.message.chat_id, document=f, filename=f"Target_Leads.csv",
-                caption=f"🎯 *Target Reached!*\n📊 Total Leads: {len(leads)} | 📧 Emails: {em} | 📞 Phones: {ph}", parse_mode='Markdown'
+                chat_id=q.message.chat_id, document=f, filename=f"Strict_Leads.csv",
+                caption=f"🎯 *Target Reached!*\n📊 Total Valid Emails: {len(leads)}", parse_mode='Markdown'
             )
         os.unlink(path)
     except Exception as e:
@@ -792,16 +636,15 @@ async def execute_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def run_telegram_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    app = Application.builder().token(CONFIG["TELEGRAM_TOKEN"]).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
     
     conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(handle_mode, pattern="^mode_")],
+        entry_points=[CallbackQueryHandler(handle_mode, pattern="^start_manual$")],
         states={
             M_LOC: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_loc)],
             M_KW: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_kw)],
             M_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_count)],
-            M_RATING: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_rating)],
-            AI_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ai_prompt)]
+            M_RATING: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_rating)]
         },
         fallbacks=[],
         per_message=False,
@@ -813,6 +656,7 @@ def run_telegram_bot():
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
-    threading.Thread(target=run_telegram_bot, daemon=True).start()
+    if TELEGRAM_TOKEN:
+        threading.Thread(target=run_telegram_bot, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host='0.0.0.0', port=port)
