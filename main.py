@@ -1,5 +1,6 @@
 import os, csv, asyncio, tempfile, threading, io, uuid, re, time, json, urllib.parse
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from groq import Groq
@@ -10,21 +11,18 @@ from telegram.ext import (
     filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 )
 
+# Disable SSL Warnings for aggressive scraping
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
 CONFIG = {
-    "TELEGRAM_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN"),
-    "GROQ_API_KEY": os.getenv("GROQ_API_KEY", "")
+    "TELEGRAM_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN")
 }
 
 # ══════════════════════════════════════════════
-#   1. PURE PYTHON GOOGLE MAPS LIBRARY
+#   1. PURE PYTHON GOOGLE MAPS LIBRARY (AGGRESSIVE)
 # ══════════════════════════════════════════════
 class GoogleMapsScraper:
-    """
-    Acts exactly like a Python Library (e.g., google-play-scraper).
-    Uses Google Local Search (tbm=lcl) to bypass JS rendering and blocks.
-    """
     def __init__(self):
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -34,105 +32,128 @@ class GoogleMapsScraper:
     def search(self, keyword, location, max_results=100, max_rating=None):
         results = []
         seen_names = set()
-        query = urllib.parse.quote(f"{keyword} in {location}")
         
-        # Google shows 20 results per page in Local Search
-        for start in range(0, int(max_results), 20):
-            url = f"https://www.google.com/search?q={query}&tbm=lcl&start={start}"
+        # Query Variations to force Google to give MORE leads
+        queries = [
+            f"{keyword} in {location}",
+            f"best {keyword} in {location}",
+            f"top {keyword} in {location}",
+            f"{keyword} near {location}",
+            f"{keyword} companies in {location}"
+        ]
+        
+        for q in queries:
+            if len(results) >= int(max_results): break
             
-            try:
-                res = requests.get(url, headers=self.headers, timeout=15)
-                soup = BeautifulSoup(res.text, 'html.parser')
+            query_encoded = urllib.parse.quote(q)
+            # Fetch up to 5 pages (100 results) per variation
+            for start in range(0, 100, 20):
+                if len(results) >= int(max_results): break
                 
-                # Find all business blocks
-                places = soup.find_all('div', class_=['VkpGBb', 'rllt__details', 'dbg0pd'])
-                
-                if not places:
-                    break # No more pages
+                url = f"https://www.google.com/search?q={query_encoded}&tbm=lcl&start={start}"
+                try:
+                    res = requests.get(url, headers=self.headers, timeout=15)
+                    soup = BeautifulSoup(res.text, 'html.parser')
+                    places = soup.find_all('div', class_=['VkpGBb', 'rllt__details', 'dbg0pd'])
                     
-                for place in places:
-                    # Extract Name
-                    name_tag = place.find(['div', 'h3', 'span'], class_='dbg0pd') or place.find('div', role='heading')
-                    name = name_tag.get_text(strip=True) if name_tag else "N/A"
-                    
-                    if name == "N/A" or name in seen_names or len(name) < 3:
-                        continue
+                    if not places: break # No more results for this variation
                         
-                    # Extract full text snippet for Regex parsing
-                    text_content = place.get_text(separator=' ', strip=True)
-                    
-                    # Extract Rating
-                    rating_match = re.search(r'(\d\.\d)\s*\(', text_content)
-                    rating = rating_match.group(1) if rating_match else "N/A"
-                    
-                    if max_rating and rating != "N/A" and float(rating) > float(max_rating):
-                        continue
+                    for place in places:
+                        name_tag = place.find(['div', 'h3', 'span'], class_='dbg0pd') or place.find('div', role='heading')
+                        name = name_tag.get_text(strip=True) if name_tag else "N/A"
                         
-                    # Extract Phone
-                    phone_match = re.search(r'(\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}', text_content)
-                    phone = phone_match.group(0) if phone_match else "N/A"
-                    
-                    # Extract Website
-                    website = "N/A"
-                    for a in place.find_all('a', href=True):
-                        href = a['href']
-                        if '/url?q=' in href and 'google.com' not in href:
-                            website = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
-                            break
-                        elif href.startswith('http') and 'google.com' not in href:
-                            website = href
-                            break
+                        if name == "N/A" or name in seen_names or len(name) < 3:
+                            continue
                             
-                    seen_names.add(name)
-                    results.append({
-                        "Name": name,
-                        "Phone": phone,
-                        "Website": website,
-                        "Rating": rating,
-                        "Address": location,
-                        "Category": keyword,
-                        "Maps_Link": f"https://www.google.com/maps/search/{urllib.parse.quote(name + ' ' + location)}"
-                    })
-                    
-                    if len(results) >= int(max_results):
-                        return results
+                        text_content = place.get_text(separator=' ', strip=True)
                         
-                time.sleep(1) # Anti-block delay between pages
-            except Exception as e:
-                print(f"Library Error: {e}")
-                break
+                        rating_match = re.search(r'(\d\.\d)\s*\(', text_content)
+                        rating = rating_match.group(1) if rating_match else "N/A"
+                        
+                        if max_rating and rating != "N/A" and float(rating) > float(max_rating):
+                            continue
+                            
+                        phone_match = re.search(r'(\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}', text_content)
+                        phone = phone_match.group(0) if phone_match else "N/A"
+                        
+                        website = "N/A"
+                        for a in place.find_all('a', href=True):
+                            href = a['href']
+                            if '/url?q=' in href and 'google.com' not in href:
+                                website = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
+                                break
+                            elif href.startswith('http') and 'google.com' not in href:
+                                website = href
+                                break
+                                
+                        seen_names.add(name)
+                        results.append({
+                            "Name": name,
+                            "Phone": phone,
+                            "Website": website,
+                            "Rating": rating,
+                            "Address": location,
+                            "Category": keyword,
+                            "Maps_Link": f"https://www.google.com/maps/search/{urllib.parse.quote(name + ' ' + location)}"
+                        })
+                        
+                        if len(results) >= int(max_results):
+                            return results
+                            
+                except Exception as e:
+                    print(f"Library Error: {e}")
+                    break
+                time.sleep(1) # Anti-block delay
                 
         return results
 
 # ══════════════════════════════════════════════
-#   2. DEEP EMAIL EXTRACTOR LIBRARY
+#   2. AGGRESSIVE DEEP EMAIL EXTRACTOR
 # ══════════════════════════════════════════════
 class DeepEmailExtractor:
     def __init__(self):
-        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        self.email_regex = r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
+        self.email_regex = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+
+    def extract_from_html(self, html):
+        emails = set(re.findall(self.email_regex, html))
+        valid = []
+        for e in emails:
+            e = e.lower()
+            if not any(x in e for x in ['.png', '.jpg', '.gif', 'sentry', 'example', 'domain', 'wixpress', '@2x', 'noreply']):
+                valid.append(e)
+        return valid
 
     def get_email(self, url):
         if not url or url == "N/A": return "N/A"
         if not url.startswith('http'): url = 'http://' + url
         
-        try:
-            r = requests.get(url, headers=self.headers, timeout=8, verify=False)
-            emails = list(set(re.findall(self.email_regex, r.text)))
-            valid_emails = [e for e in emails if not any(x in e.lower() for x in ['example', 'domain', 'sentry', '@2x', '.png', '.jpg'])]
-            if valid_emails: return valid_emails[0]
-            
-            # Try contact page
-            soup = BeautifulSoup(r.text, 'html.parser')
-            for a in soup.find_all('a', href=True):
-                if 'contact' in a.get('href', '').lower():
-                    contact_link = urllib.parse.urljoin(url, a['href'])
-                    r2 = requests.get(contact_link, headers=self.headers, timeout=8, verify=False)
-                    emails2 = list(set(re.findall(self.email_regex, r2.text)))
-                    valid_emails2 = [e for e in emails2 if not any(x in e.lower() for x in ['example', 'domain', 'sentry', '@2x'])]
-                    if valid_emails2: return valid_emails2[0]
-        except:
-            pass
+        # Check homepage, contact page, and about page
+        paths_to_check = ['', '/contact', '/contact-us', '/about', '/about-us']
+        
+        for path in paths_to_check:
+            target_url = urllib.parse.urljoin(url, path)
+            try:
+                r = requests.get(target_url, headers=self.headers, timeout=10, verify=False)
+                
+                # 1. Check mailto: links first (most accurate)
+                soup = BeautifulSoup(r.text, 'html.parser')
+                for a in soup.find_all('a', href=True):
+                    if a['href'].startswith('mailto:'):
+                        email = a['href'].replace('mailto:', '').split('?')[0].strip()
+                        if '@' in email and '.' in email:
+                            return email
+                            
+                # 2. Check raw HTML text
+                found_emails = self.extract_from_html(r.text)
+                if found_emails:
+                    return found_emails[0]
+            except:
+                continue
+                
         return "N/A"
 
 # ══════════════════════════════════════════════
@@ -142,10 +163,8 @@ def run_full_scraper(location, keyword, max_leads=100, max_rating=None):
     maps_lib = GoogleMapsScraper()
     email_lib = DeepEmailExtractor()
     
-    # 1. Get Leads from Google Local
     raw_leads = maps_lib.search(keyword, location, max_leads, max_rating)
     
-    # 2. Enrich with Emails and Filter Quality
     final_leads = []
     for lead in raw_leads:
         if lead['Website'] != 'N/A':
@@ -153,7 +172,6 @@ def run_full_scraper(location, keyword, max_leads=100, max_rating=None):
         else:
             lead['Email'] = "N/A"
             
-        # Quality Check: Keep only if it has Phone or Email or Website
         if lead['Phone'] != 'N/A' or lead['Email'] != 'N/A' or lead['Website'] != 'N/A':
             final_leads.append(lead)
             
@@ -162,11 +180,11 @@ def run_full_scraper(location, keyword, max_leads=100, max_rating=None):
 # ══════════════════════════════════════════════
 #   GROQ AI BRAIN
 # ══════════════════════════════════════════════
-def parse_with_ai(user_text):
-    if not CONFIG["GROQ_API_KEY"]:
+def parse_with_ai(user_text, api_key):
+    if not api_key:
         raise Exception("Groq API Key is missing! Please add it in settings.")
     
-    client = Groq(api_key=CONFIG["GROQ_API_KEY"])
+    client = Groq(api_key=api_key)
     prompt = f"""
     You are an AI assistant for a Lead Generation tool.
     Extract the following details from the user's input:
@@ -191,7 +209,7 @@ def parse_with_ai(user_text):
         if json_match: return json.loads(json_match.group(0))
         return json.loads(response)
     except Exception as e:
-        raise Exception("Failed to connect to Groq AI. Please check your API Key in Settings.")
+        raise Exception("Failed to connect to Groq AI. Check your API Key.")
 
 # ══════════════════════════════════════════════
 #   WEB DASHBOARD (FLASK + DARK TAILWIND CSS)
@@ -237,7 +255,7 @@ HTML_TEMPLATE = """
                 <div class="bg-gradient-to-br from-indigo-500 to-purple-600 text-white p-3 rounded-xl shadow-lg"><i class="fa-solid fa-map-location-dot text-2xl"></i></div>
                 <div>
                     <h1 class="text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-purple-400">LeadGen Pro</h1>
-                    <span class="text-xs font-bold bg-green-500 text-white px-2 py-1 rounded-full">Python Library Engine (100% Free)</span>
+                    <span class="text-xs font-bold bg-green-500 text-white px-2 py-1 rounded-full">Aggressive Python Engine (100% Free)</span>
                 </div>
             </div>
             <button onclick="switchTab('settings')" class="text-gray-400 hover:text-white transition bg-gray-800 p-3 rounded-xl border border-gray-700"><i class="fa-solid fa-gear text-xl"></i></button>
@@ -313,6 +331,12 @@ HTML_TEMPLATE = """
         let currentJob = null;
         let aiState = {};
 
+        // Load Groq Key from LocalStorage on page load
+        window.onload = () => {
+            const savedKey = localStorage.getItem('groq_key');
+            if(savedKey) document.getElementById('groq-key').value = savedKey;
+        };
+
         function switchTab(tab) {
             ['manual', 'ai', 'settings'].forEach(t => {
                 document.getElementById('content-'+t).classList.add('hidden');
@@ -326,11 +350,8 @@ HTML_TEMPLATE = """
 
         function saveSettings() {
             const groq = document.getElementById('groq-key').value;
-            fetch('/api/settings', { 
-                method: 'POST', 
-                headers: {'Content-Type':'application/json'}, 
-                body: JSON.stringify({groq: groq}) 
-            }).then(() => alert('Settings Saved Successfully!'));
+            localStorage.setItem('groq_key', groq);
+            alert('Settings Saved Successfully! It will now work perfectly.');
         }
 
         function showStatus(msg, isSpin=true, isError=false) {
@@ -350,7 +371,7 @@ HTML_TEMPLATE = """
         }
 
         async function startJob(payload) {
-            showStatus('Running Python Library Engine (Extracting Data & Emails)...');
+            showStatus('Running Aggressive Python Engine (Extracting Data & Emails)...');
             const res = await fetch('/api/scrape', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
             const data = await res.json();
             if(data.error) return showStatus(data.error, false, true);
@@ -408,6 +429,13 @@ HTML_TEMPLATE = """
             const inp = document.getElementById('ai-input');
             const text = inp.value.trim();
             if(!text) return;
+            
+            const groqKey = localStorage.getItem('groq_key');
+            if(!groqKey) {
+                addMsg("Groq API Key is missing! Please add it in the Settings tab first.", true);
+                return;
+            }
+
             addMsg(text, false);
             inp.value = '';
 
@@ -423,7 +451,7 @@ HTML_TEMPLATE = """
                 const res = await fetch('/api/chat', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({text: text, state: aiState})
+                    body: JSON.stringify({text: text, state: aiState, groq_key: groqKey})
                 });
                 const data = await res.json();
                 
@@ -462,19 +490,16 @@ HTML_TEMPLATE = """
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@flask_app.route('/api/settings', methods=['POST'])
-def update_settings():
-    if request.json.get('groq'): CONFIG["GROQ_API_KEY"] = request.json.get('groq')
-    return jsonify({"success": True})
-
 @flask_app.route('/api/chat', methods=['POST'])
 def handle_chat():
     text = request.json.get('text')
+    groq_key = request.json.get('groq_key')
+    
     if text.lower() in ['yes', 'start', 'do it', 'go']:
         return jsonify({"ready": True, "state": request.json.get('state')})
 
     try:
-        parsed = parse_with_ai(text)
+        parsed = parse_with_ai(text, groq_key)
     except Exception as e:
         return jsonify({"error": str(e)})
     
@@ -548,14 +573,11 @@ def to_csv(leads):
     tmp.close()
     return tmp.name
 
-M_LOC, M_KW, M_COUNT, M_RATING, AI_PROMPT = range(5)
+M_LOC, M_KW, M_COUNT, M_RATING = range(4)
 bot_store = {}
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [InlineKeyboardButton("🛠️ Manual Search", callback_data="mode_manual")],
-        [InlineKeyboardButton("🤖 Groq AI Search", callback_data="mode_ai")]
-    ]
+    kb = [[InlineKeyboardButton("🛠️ Manual Search", callback_data="mode_manual")]]
     await update.message.reply_text("👋 *Pro Lead Gen Bot (Python Library Engine)*\n\nকীভাবে সার্চ করতে চাও?", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
 
 async def handle_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -564,12 +586,8 @@ async def handle_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     bot_store[uid] = {}
     
-    if q.data == "mode_manual":
-        await q.edit_message_text("📍 *Manual Mode*\nLocation দাও (e.g. Vancouver):", parse_mode='Markdown')
-        return M_LOC
-    else:
-        await q.edit_message_text("🤖 *Groq AI Mode*\nআমাকে ইংরেজিতে বলো তুমি কী খুঁজছো।\n\n_Example: I need 100 leads for car showrooms in Vancouver with maximum 3 star rating_", parse_mode='Markdown')
-        return AI_PROMPT
+    await q.edit_message_text("📍 *Manual Mode*\nLocation দাও (e.g. Vancouver):", parse_mode='Markdown')
+    return M_LOC
 
 async def m_loc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot_store[update.message.from_user.id]['loc'] = update.message.text
@@ -590,36 +608,11 @@ async def m_rating(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.lower()
     uid = update.message.from_user.id
     bot_store[uid]['rating'] = None if txt == 'skip' else txt
-    return await ask_confirm(update, uid)
-
-async def ai_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    uid = update.message.from_user.id
-    msg = await update.message.reply_text("🤖 _Thinking..._", parse_mode='Markdown')
     
-    try:
-        parsed = parse_with_ai(text)
-        if not parsed.get('loc') or not parsed.get('kw'):
-            await msg.edit_text("🤖 আমি ঠিক বুঝতে পারিনি। দয়া করে Keyword এবং Location পরিষ্কার করে বলো।")
-            return AI_PROMPT
-            
-        bot_store[uid] = {
-            'loc': parsed['loc'],
-            'kw': parsed['kw'],
-            'count': parsed.get('count', 100),
-            'rating': parsed.get('rating')
-        }
-        await msg.delete()
-        return await ask_confirm(update, uid)
-    except Exception as e:
-        await msg.edit_text(f"❌ {str(e)}")
-        return AI_PROMPT
-
-async def ask_confirm(update, uid):
     data = bot_store[uid]
-    txt = f"📋 *Summary (Library Engine)*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Leads: {data['count']}\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nশুরু করবো?"
+    txt_summary = f"📋 *Summary (Library Engine)*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Leads: {data['count']}\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nশুরু করবো?"
     kb = [[InlineKeyboardButton("✅ Start Automation", callback_data="start_scrape")]]
-    await update.message.reply_text(txt, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text(txt_summary, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
 
 async def execute_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -635,7 +628,7 @@ async def execute_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         leads = await loop.run_in_executor(None, run_full_scraper, data['loc'], data['kw'], data['count'], data.get('rating'))
         
         if not leads:
-            return await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text="😔 কোনো result নেই। দয়া করে দেশের নামের বদলে নির্দিষ্ট শহরের নাম (যেমন: Vancouver) দিয়ে সার্চ করো।")
+            return await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text="😔 কোনো result নেই। দয়া করে নির্দিষ্ট শহরের নাম দিয়ে সার্চ করো।")
 
         path = to_csv(leads)
         em = sum(1 for l in leads if str(l.get('Email','')) not in ('N/A','','None'))
@@ -661,8 +654,7 @@ def run_telegram_bot():
             M_LOC: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_loc)],
             M_KW: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_kw)],
             M_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_count)],
-            M_RATING: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_rating)],
-            AI_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ai_prompt)]
+            M_RATING: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_rating)]
         },
         fallbacks=[],
         per_message=False,
