@@ -30,7 +30,6 @@ class GoogleMapsScraper:
 
     def get_page(self, keyword, location, start):
         results = []
-        # Using exact original URL encoding
         query = urllib.parse.quote(f"{keyword} in {location}")
         url = f"https://www.google.com/search?q={query}&tbm=lcl&start={start}"
         
@@ -38,31 +37,28 @@ class GoogleMapsScraper:
             res = requests.get(url, headers=self.headers, timeout=15)
             soup = BeautifulSoup(res.text, 'html.parser')
             
-            # Find all business blocks exactly like original code
+            # Find all business blocks exactly like your original working code
             places = soup.find_all('div', class_=['VkpGBb', 'rllt__details', 'dbg0pd'])
             
-            if not places:
+            if not places: 
                 return []
                 
             for place in places:
-                # Extract Name
                 name_tag = place.find(['div', 'h3', 'span'], class_='dbg0pd') or place.find('div', role='heading')
                 name = name_tag.get_text(strip=True) if name_tag else "N/A"
                 
-                if name == "N/A" or len(name) < 3:
+                if name == "N/A" or len(name) < 3: 
                     continue
                     
                 text_content = place.get_text(separator=' ', strip=True)
                 
-                # Extract Rating (Original Regex)
-                rating_match = re.search(r'(\d\.\d)\s*\(', text_content)
-                rating = rating_match.group(1) if rating_match else "N/A"
+                # Robust Rating Extraction
+                rating_match = re.search(r'(\d[\.,]\d)\s*(?:\(|stars|reviews)', text_content)
+                rating = rating_match.group(1).replace(',', '.') if rating_match else "N/A"
                 
-                # Extract Phone (Original Regex)
                 phone_match = re.search(r'(\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}', text_content)
                 phone = phone_match.group(0) if phone_match else "N/A"
                 
-                # Extract Website (Original Logic)
                 website = "N/A"
                 for a in place.find_all('a', href=True):
                     href = a['href']
@@ -83,7 +79,7 @@ class GoogleMapsScraper:
                     "Maps_Link": f"https://www.google.com/maps/search/{urllib.parse.quote(name + ' ' + location)}"
                 })
         except Exception as e:
-            print(f"Maps Scraper Error: {e}")
+            pass
             
         return results
 
@@ -98,24 +94,21 @@ class DeepEmailExtractor:
     def get_email(self, url):
         if not url or url == "N/A": return "N/A"
         if not url.startswith('http'): url = 'http://' + url
-        
         try:
             r = requests.get(url, headers=self.headers, timeout=8, verify=False)
             emails = list(set(re.findall(self.email_regex, r.text)))
-            valid_emails = [e for e in emails if not any(x in e.lower() for x in ['example', 'domain', 'sentry', '@2x', '.png', '.jpg'])]
-            if valid_emails: return valid_emails[0]
+            valid = [e for e in emails if not any(x in e.lower() for x in ['example','domain','sentry','@2x','.png','.jpg','wixpress'])]
+            if valid: return valid[0]
             
-            # Try contact page
             soup = BeautifulSoup(r.text, 'html.parser')
             for a in soup.find_all('a', href=True):
                 if 'contact' in a.get('href', '').lower():
-                    contact_link = urllib.parse.urljoin(url, a['href'])
-                    r2 = requests.get(contact_link, headers=self.headers, timeout=8, verify=False)
+                    clink = urllib.parse.urljoin(url, a['href'])
+                    r2 = requests.get(clink, headers=self.headers, timeout=8, verify=False)
                     emails2 = list(set(re.findall(self.email_regex, r2.text)))
-                    valid_emails2 = [e for e in emails2 if not any(x in e.lower() for x in ['example', 'domain', 'sentry', '@2x'])]
-                    if valid_emails2: return valid_emails2[0]
-        except:
-            pass
+                    valid2 = [e for e in emails2 if not any(x in e.lower() for x in ['example','domain','sentry','@2x','.png','.jpg'])]
+                    if valid2: return valid2[0]
+        except: pass
         return "N/A"
 
 # ══════════════════════════════════════════════
@@ -211,7 +204,7 @@ def run_job_thread(job_id, data):
                 
                 if not raw_batch:
                     empty_strikes += 1
-                    if empty_strikes >= 3: break # Original logic tolerance
+                    if empty_strikes >= 2: break
                 else:
                     empty_strikes = 0
                     
@@ -756,7 +749,7 @@ async def background_bot_task(chat_id, message_id, data, bot):
                 raw_batch = await loop.run_in_executor(None, maps_lib.get_page, current_kw, data['loc'], start)
                 if not raw_batch:
                     empty_strikes += 1
-                    if empty_strikes >= 3: break
+                    if empty_strikes >= 2: break
                 else:
                     empty_strikes = 0
                     
