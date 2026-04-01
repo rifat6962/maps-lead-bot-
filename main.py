@@ -19,59 +19,57 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # ══════════════════════════════════════════════
-#   1. PURE PYTHON GOOGLE MAPS LIBRARY (RESTORED)
+#   1. PURE PYTHON GOOGLE MAPS LIBRARY (100% ORIGINAL RESTORED)
 # ══════════════════════════════════════════════
-def get_headers():
-    HEADERS_LIST = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/118.0.0.0 Safari/537.36",
-    ]
-    return {
-        "User-Agent": random.choice(HEADERS_LIST),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Referer": "https://www.google.com/",
-    }
-
 class GoogleMapsScraper:
+    def __init__(self):
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9"
+        }
+
     def get_page(self, keyword, location, start):
         results = []
-        query = urllib.parse.quote_plus(f"{keyword} in {location}")
-        url = f"https://www.google.com/search?q={query}&tbm=lcl&start={start}&num=20&hl=en"
+        # Using exact original URL encoding
+        query = urllib.parse.quote(f"{keyword} in {location}")
+        url = f"https://www.google.com/search?q={query}&tbm=lcl&start={start}"
         
         try:
-            res = requests.get(url, headers=get_headers(), timeout=15)
+            res = requests.get(url, headers=self.headers, timeout=15)
             soup = BeautifulSoup(res.text, 'html.parser')
             
-            # Restored the powerful exact selectors from your original code
-            blocks = soup.select('div.VkpGBb, div.rllt__details, div[jscontroller]')
-            if not blocks:
-                blocks = soup.select('div.uMdZh, div.cXedhc')
+            # Find all business blocks exactly like original code
+            places = soup.find_all('div', class_=['VkpGBb', 'rllt__details', 'dbg0pd'])
+            
+            if not places:
+                return []
                 
-            if not blocks: return []
+            for place in places:
+                # Extract Name
+                name_tag = place.find(['div', 'h3', 'span'], class_='dbg0pd') or place.find('div', role='heading')
+                name = name_tag.get_text(strip=True) if name_tag else "N/A"
                 
-            for block in blocks:
-                text_content = block.get_text(separator=' ', strip=True)
-                
-                name_el = block.select_one('div[role="heading"], .dbg0pd, span.OSrXXb')
-                name = name_el.get_text(strip=True) if name_el else "N/A"
-                
-                if name == "N/A" or len(name) < 3: continue
+                if name == "N/A" or len(name) < 3:
+                    continue
                     
-                rating_match = re.search(r'(\d[\.,]\d)\s*(?:\(|stars|reviews)', text_content)
-                rating = rating_match.group(1).replace(',', '.') if rating_match else "N/A"
+                text_content = place.get_text(separator=' ', strip=True)
                 
+                # Extract Rating (Original Regex)
+                rating_match = re.search(r'(\d\.\d)\s*\(', text_content)
+                rating = rating_match.group(1) if rating_match else "N/A"
+                
+                # Extract Phone (Original Regex)
                 phone_match = re.search(r'(\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}', text_content)
-                phone = phone_match.group(0).strip() if phone_match else "N/A"
+                phone = phone_match.group(0) if phone_match else "N/A"
                 
+                # Extract Website (Original Logic)
                 website = "N/A"
-                for a in block.select('a[href]'):
+                for a in place.find_all('a', href=True):
                     href = a['href']
-                    if '/url?q=' in href and 'google' not in href.lower():
+                    if '/url?q=' in href and 'google.com' not in href:
                         website = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
                         break
-                    elif href.startswith('http') and 'google' not in href.lower():
+                    elif href.startswith('http') and 'google.com' not in href:
                         website = href
                         break
                         
@@ -85,35 +83,39 @@ class GoogleMapsScraper:
                     "Maps_Link": f"https://www.google.com/maps/search/{urllib.parse.quote(name + ' ' + location)}"
                 })
         except Exception as e:
-            pass
+            print(f"Maps Scraper Error: {e}")
             
         return results
 
 # ══════════════════════════════════════════════
-#   2. DEEP EMAIL EXTRACTOR LIBRARY
+#   2. DEEP EMAIL EXTRACTOR LIBRARY (100% ORIGINAL RESTORED)
 # ══════════════════════════════════════════════
 class DeepEmailExtractor:
     def __init__(self):
+        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         self.email_regex = r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
 
     def get_email(self, url):
         if not url or url == "N/A": return "N/A"
         if not url.startswith('http'): url = 'http://' + url
+        
         try:
-            r = requests.get(url, headers=get_headers(), timeout=8, verify=False)
+            r = requests.get(url, headers=self.headers, timeout=8, verify=False)
             emails = list(set(re.findall(self.email_regex, r.text)))
-            valid = [e for e in emails if not any(x in e.lower() for x in ['example','domain','sentry','@2x','.png','.jpg','wixpress'])]
-            if valid: return valid[0]
+            valid_emails = [e for e in emails if not any(x in e.lower() for x in ['example', 'domain', 'sentry', '@2x', '.png', '.jpg'])]
+            if valid_emails: return valid_emails[0]
             
+            # Try contact page
             soup = BeautifulSoup(r.text, 'html.parser')
-            for a in soup.select('a[href]'):
+            for a in soup.find_all('a', href=True):
                 if 'contact' in a.get('href', '').lower():
-                    clink = urllib.parse.urljoin(url, a['href'])
-                    r2 = requests.get(clink, headers=get_headers(), timeout=8, verify=False)
+                    contact_link = urllib.parse.urljoin(url, a['href'])
+                    r2 = requests.get(contact_link, headers=self.headers, timeout=8, verify=False)
                     emails2 = list(set(re.findall(self.email_regex, r2.text)))
-                    valid2 = [e for e in emails2 if not any(x in e.lower() for x in ['example','domain','sentry','@2x','.png','.jpg'])]
-                    if valid2: return valid2[0]
-        except: pass
+                    valid_emails2 = [e for e in emails2 if not any(x in e.lower() for x in ['example', 'domain', 'sentry', '@2x'])]
+                    if valid_emails2: return valid_emails2[0]
+        except:
+            pass
         return "N/A"
 
 # ══════════════════════════════════════════════
@@ -187,7 +189,7 @@ def run_job_thread(job_id, data):
         jobs[job_id] = {'status': 'scraping', 'count': 0, 'status_text': 'Starting engine...'}
         
         kw_attempts = 0
-        max_kw_attempts = 15 # Prevent infinite loops if location is completely empty
+        max_kw_attempts = 15 # Prevent infinite loops
         
         # --- PHASE 1: SCRAPING (Target Guarantee) ---
         while len(final_leads) < max_leads and kw_attempts < max_kw_attempts:
@@ -209,7 +211,7 @@ def run_job_thread(job_id, data):
                 
                 if not raw_batch:
                     empty_strikes += 1
-                    if empty_strikes >= 2: break
+                    if empty_strikes >= 3: break # Original logic tolerance
                 else:
                     empty_strikes = 0
                     
@@ -217,7 +219,7 @@ def run_job_thread(job_id, data):
                     if len(final_leads) >= max_leads: break
                     if lead['Name'] in seen_names: continue
                     
-                    # Rating Filter
+                    # Rating Filter (Bad Reviews)
                     if max_rating and lead['Rating'] != "N/A":
                         try:
                             if float(lead['Rating']) > float(max_rating): continue
@@ -233,7 +235,7 @@ def run_job_thread(job_id, data):
                     final_leads.append(lead)
                     
                     jobs[job_id]['count'] = len(final_leads)
-                    jobs[job_id]['leads'] = final_leads # Update live
+                    jobs[job_id]['leads'] = final_leads # Update live for UI
                     jobs[job_id]['status_text'] = f"Found {len(final_leads)}/{max_leads} valid emails... (Searching: {current_kw})"
                         
                 start += 20
@@ -280,6 +282,7 @@ def run_job_thread(job_id, data):
 #   FLASK DASHBOARD & API
 # ══════════════════════════════════════════════
 flask_app = Flask(__name__)
+jobs = {}
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -616,7 +619,6 @@ async function startJob(){
               setSt(d2.error, 'err');
             }
             else {
-              // CRITICAL FIX: Keep polling if status is not found or delayed
               setTimeout(poll, 3000);
             }
         } catch(e) {
@@ -652,7 +654,6 @@ def start_api_job():
 def status(job_id):
     job = jobs.get(job_id, {'status': 'not_found'})
     out = dict(job)
-    # Send leads to UI for preview if scraping is done or emails are sending
     if out.get('status') in ['sending_emails', 'done', 'scraping']:
         out['leads'] = job.get('leads', [])
     return jsonify(out)
@@ -755,7 +756,7 @@ async def background_bot_task(chat_id, message_id, data, bot):
                 raw_batch = await loop.run_in_executor(None, maps_lib.get_page, current_kw, data['loc'], start)
                 if not raw_batch:
                     empty_strikes += 1
-                    if empty_strikes >= 2: break
+                    if empty_strikes >= 3: break
                 else:
                     empty_strikes = 0
                     
