@@ -1,5 +1,6 @@
 import os, csv, asyncio, tempfile, threading, io, uuid, re, time, json, urllib.parse, random
 import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from groq import Groq
@@ -18,21 +19,141 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-def get_headers():
-    HEADERS_LIST = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/118.0.0.0 Safari/537.36",
-    ]
-    return {
-        "User-Agent": random.choice(HEADERS_LIST),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Referer": "https://www.google.com/",
-    }
+# ══════════════════════════════════════════════
+#   FREE PROXY MANAGER — Auto-fetches & rotates
+# ══════════════════════════════════════════════
+class ProxyManager:
+    def __init__(self):
+        self.proxies = []
+        self.last_fetch = 0
+        self.fetch_interval = 600  # re-fetch every 10 min
+        self._lock = threading.Lock()
+
+    def _fetch_proxies(self):
+        """Fetch free proxies from multiple sources"""
+        fresh = []
+        sources = [
+            "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all&simplified=true",
+            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+            "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-status.txt",
+        ]
+        for url in sources:
+            try:
+                r = requests.get(url, timeout=10)
+                lines = r.text.strip().split('\n')
+                for line in lines:
+                    line = line.strip()
+                    # format: ip:port or ip:port status
+                    match = re.match(r'(\d+\.\d+\.\d+\.\d+:\d+)', line)
+                    if match:
+                        fresh.append(match.group(1))
+                if fresh:
+                    break  # one source is enough
+            except:
+                continue
+        return list(set(fresh))[:150]  # keep top 150
+
+    def get_proxy(self):
+        """Return a random proxy dict, refreshing list if stale"""
+        with self._lock:
+            now = time.time()
+            if not self.proxies or (now - self.last_fetch) > self.fetch_interval:
+                fetched = self._fetch_proxies()
+                if fetched:
+                    self.proxies = fetched
+                    self.last_fetch = now
+            if self.proxies:
+                p = random.choice(self.proxies)
+                return {"http": f"http://{p}", "https": f"http://{p}"}
+        return None
+
+    def remove_proxy(self, proxy_dict):
+        """Remove a bad proxy from the pool"""
+        with self._lock:
+            if proxy_dict:
+                addr = proxy_dict.get("http", "").replace("http://", "")
+                self.proxies = [p for p in self.proxies if p != addr]
+
+proxy_mgr = ProxyManager()
 
 # ══════════════════════════════════════════════
-#   1. PURE PYTHON GOOGLE MAPS LIBRARY (RESTORED FROM FILE 2)
+#   SMART REQUEST WRAPPER
+#   Tries: cloudscraper → proxy → direct fallback
+# ══════════════════════════════════════════════
+def smart_get(url, timeout=15):
+    """
+    3-layer bypass:
+    1. cloudscraper (bypasses Cloudflare & JS challenges)
+    2. cloudscraper + rotating free proxy
+    3. plain requests as last resort
+    """
+    headers = _random_headers()
+
+    # --- Layer 1: cloudscraper direct ---
+    try:
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+        scraper.headers.update(headers)
+        r = scraper.get(url, timeout=timeout)
+        if r.status_code == 200 and len(r.text) > 500:
+            return r
+    except Exception:
+        pass
+
+    # --- Layer 2: cloudscraper + proxy ---
+    proxy = proxy_mgr.get_proxy()
+    if proxy:
+        try:
+            scraper2 = cloudscraper.create_scraper(
+                browser={"browser": "firefox", "platform": "linux", "mobile": False}
+            )
+            scraper2.headers.update(headers)
+            r2 = scraper2.get(url, proxies=proxy, timeout=timeout)
+            if r2.status_code == 200 and len(r2.text) > 500:
+                return r2
+        except Exception:
+            proxy_mgr.remove_proxy(proxy)
+
+    # --- Layer 3: plain requests fallback ---
+    try:
+        r3 = requests.get(url, headers=headers, timeout=timeout, verify=False)
+        return r3
+    except Exception:
+        return None
+
+def _random_headers():
+    UA_LIST = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    ]
+    return {
+        "User-Agent": random.choice(UA_LIST),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": random.choice([
+            "https://www.google.com/",
+            "https://www.bing.com/",
+            "https://duckduckgo.com/",
+        ]),
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "cross-site",
+        "Cache-Control": "max-age=0",
+    }
+
+def get_headers():
+    return _random_headers()
+
+# ══════════════════════════════════════════════
+#   1. GOOGLE MAPS SCRAPER (uses smart_get now)
 # ══════════════════════════════════════════════
 class GoogleMapsScraper:
     def get_page(self, keyword, location, start):
@@ -41,7 +162,9 @@ class GoogleMapsScraper:
         url = f"https://www.google.com/search?q={query}&tbm=lcl&start={start}&num=20&hl=en"
         
         try:
-            res = requests.get(url, headers=get_headers(), timeout=15)
+            res = smart_get(url)
+            if not res:
+                return results
             soup = BeautifulSoup(res.text, 'html.parser')
             
             # Phase 1: Local Search Selectors
@@ -95,7 +218,9 @@ class GoogleMapsScraper:
         query = urllib.parse.quote_plus(f"{keyword} {location}")
         url = f"https://www.google.com/maps/search/{query}"
         try:
-            r = requests.get(url, headers=get_headers(), timeout=15)
+            r = smart_get(url)
+            if not r:
+                return results
             text = r.text
             names = re.findall(r'"([^"]{3,60})"(?:,null){0,3},"[^"]*","[^"]*"', text)
             phones = re.findall(r'(\+?1?\s?[\(\-]?\d{3}[\)\-\s]?\s?\d{3}[\-\s]?\d{4})', text)
@@ -122,7 +247,7 @@ class GoogleMapsScraper:
         return results
 
 # ══════════════════════════════════════════════
-#   2. DEEP EMAIL EXTRACTOR LIBRARY
+#   2. DEEP EMAIL EXTRACTOR LIBRARY (uses smart_get)
 # ══════════════════════════════════════════════
 class DeepEmailExtractor:
     def __init__(self):
@@ -132,7 +257,9 @@ class DeepEmailExtractor:
         if not url or url == "N/A": return "N/A"
         if not url.startswith('http'): url = 'http://' + url
         try:
-            r = requests.get(url, headers=get_headers(), timeout=8, verify=False)
+            r = smart_get(url)
+            if not r:
+                return "N/A"
             emails = list(set(re.findall(self.email_regex, r.text)))
             valid = [e for e in emails if not any(x in e.lower() for x in ['example','domain','sentry','@2x','.png','.jpg','wixpress'])]
             if valid: return valid[0]
@@ -141,7 +268,9 @@ class DeepEmailExtractor:
             for a in soup.select('a[href]'):
                 if 'contact' in a.get('href', '').lower():
                     clink = urllib.parse.urljoin(url, a['href'])
-                    r2 = requests.get(clink, headers=get_headers(), timeout=8, verify=False)
+                    r2 = smart_get(clink)
+                    if not r2:
+                        continue
                     emails2 = list(set(re.findall(self.email_regex, r2.text)))
                     valid2 = [e for e in emails2 if not any(x in e.lower() for x in ['example','domain','sentry','@2x','.png','.jpg'])]
                     if valid2: return valid2[0]
@@ -271,8 +400,8 @@ def run_job_thread(job_id, data):
                     jobs[job_id]['leads'] = final_leads # Update live for UI
                         
                 start += 20
-                time.sleep(1.5)
-            time.sleep(2)
+                time.sleep(random.uniform(2.5, 4.5))  # randomized delay, harder to detect
+            time.sleep(random.uniform(3, 6))
             
         jobs[job_id]['leads'] = final_leads
         
@@ -812,8 +941,8 @@ async def background_bot_task(chat_id, message_id, data, bot):
                     seen_names.add(lead['Name'])
                     final_leads.append(lead)
                 start += 20
-                await asyncio.sleep(1.5)
-            await asyncio.sleep(2)
+                await asyncio.sleep(random.uniform(2.5, 4.5))
+            await asyncio.sleep(random.uniform(3, 6))
             
         if not final_leads:
             await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="😔 No results found.")
