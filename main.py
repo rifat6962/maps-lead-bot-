@@ -2,21 +2,33 @@ import os
 import csv
 import asyncio
 import re
+import time
 import tempfile
 import urllib.parse
+import requests
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 )
-from playwright.async_api import async_playwright
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 LOCATION, KEYWORD, CONFIRM = range(3)
 user_data_store = {}
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
 # ══════════════════════════════════════════════
 #   EMAIL EXTRACTOR
@@ -27,7 +39,8 @@ EMAIL_REGEX = r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
 SKIP_PATTERNS = [
     '@2x', '@3x', 'example.com', 'sentry.io', 'yourdomain',
     'domain.com', 'wixpress', 'squarespace', 'amazonaws',
-    'cloudfront', '@schema', 'noreply', 'no-reply'
+    'cloudfront', '@schema', 'noreply', 'no-reply',
+    'placeholder', 'test.com', 'email.com'
 ]
 
 def clean_emails(raw_list):
@@ -36,38 +49,39 @@ def clean_emails(raw_list):
         e = e.lower().strip()
         if any(skip in e for skip in SKIP_PATTERNS):
             continue
-        if len(e) > 6 and '.' in e.split('@')[-1]:
+        parts = e.split('@')
+        if len(parts) == 2 and '.' in parts[1] and len(e) > 6:
             cleaned.append(e)
     return list(dict.fromkeys(cleaned))
 
 
-async def extract_email_from_website(page, website_url: str) -> str:
-    if not website_url or website_url == "N/A":
+def extract_email_from_url(url: str) -> str:
+    if not url or url == "N/A":
         return "N/A"
 
     try:
-        # ── Layer 1: Homepage HTML থেকে email খোঁজো ──
-        await page.goto(website_url, wait_until="domcontentloaded", timeout=15000)
-        await asyncio.sleep(1.5)
+        parsed = urllib.parse.urlparse(url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
 
-        html = await page.content()
-        found = clean_emails(re.findall(EMAIL_REGEX, html))
+        # Layer 1: Homepage
+        r = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
+        soup = BeautifulSoup(r.text, 'html.parser')
+
+        # mailto: links সবার আগে চেক
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if href.startswith('mailto:'):
+                email = href.replace('mailto:', '').split('?')[0].strip()
+                cleaned = clean_emails([email])
+                if cleaned:
+                    return cleaned[0]
+
+        # HTML থেকে regex
+        found = clean_emails(re.findall(EMAIL_REGEX, r.text))
         if found:
             return found[0]
 
-        # ── Layer 2: mailto: link থেকে খোঁজো ──
-        mailto_links = await page.locator('a[href^="mailto:"]').all()
-        for link in mailto_links[:5]:
-            href = await link.get_attribute('href') or ''
-            email = href.replace('mailto:', '').split('?')[0].strip()
-            cleaned = clean_emails([email])
-            if cleaned:
-                return cleaned[0]
-
-        # ── Layer 3: Contact / About page এ গিয়ে খোঁজো ──
-        parsed = urllib.parse.urlparse(website_url)
-        base_url = f"{parsed.scheme}://{parsed.netloc}"
-
+        # Layer 2: Contact / About page
         contact_paths = [
             '/contact', '/contact-us', '/about', '/about-us',
             '/reach-us', '/get-in-touch', '/contactus'
@@ -76,26 +90,23 @@ async def extract_email_from_website(page, website_url: str) -> str:
         for path in contact_paths:
             try:
                 contact_url = base_url + path
-                resp = await page.goto(
-                    contact_url, wait_until="domcontentloaded", timeout=10000
+                r2 = requests.get(
+                    contact_url, headers=HEADERS, timeout=8, allow_redirects=True
                 )
-                if resp and resp.status == 200:
-                    await asyncio.sleep(1)
+                if r2.status_code == 200:
+                    soup2 = BeautifulSoup(r2.text, 'html.parser')
 
-                    # mailto: links আগে চেক করো
-                    mailto_links = await page.locator('a[href^="mailto:"]').all()
-                    for link in mailto_links[:5]:
-                        href = await link.get_attribute('href') or ''
-                        email = href.replace('mailto:', '').split('?')[0].strip()
-                        cleaned = clean_emails([email])
-                        if cleaned:
-                            return cleaned[0]
+                    for a in soup2.find_all('a', href=True):
+                        href = a['href']
+                        if href.startswith('mailto:'):
+                            email = href.replace('mailto:', '').split('?')[0].strip()
+                            cleaned = clean_emails([email])
+                            if cleaned:
+                                return cleaned[0]
 
-                    # তারপর HTML থেকে
-                    html = await page.content()
-                    found = clean_emails(re.findall(EMAIL_REGEX, html))
-                    if found:
-                        return found[0]
+                    found2 = clean_emails(re.findall(EMAIL_REGEX, r2.text))
+                    if found2:
+                        return found2[0]
             except Exception:
                 continue
 
@@ -109,142 +120,131 @@ async def extract_email_from_website(page, website_url: str) -> str:
 #   GOOGLE MAPS SCRAPER
 # ══════════════════════════════════════════════
 
-async def scrape_google_maps(location: str, keyword: str, max_results: int = 50) -> list:
+def scrape_google_maps(location: str, keyword: str, max_results: int = 50) -> list:
     results = []
-    search_query = f"{keyword} in {location}"
+    query = f"{keyword} {location}"
+    encoded = urllib.parse.quote(query)
+    url = f"https://www.google.com/maps/search/{encoded}"
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    try:
+        response = session.get(url, timeout=20)
+        html = response.text
+
+        # Business name pattern
+        names = re.findall(r'"([^"]+)",\d+\.\d+,\d+\.\d+,\d+', html)
+
+        # Phone numbers
+        phones = re.findall(
+            r'(\+?880[\s-]?\d{2}[\s-]?\d{8}|\+?8801[3-9]\d{8}|01[3-9]\d{8}|'
+            r'\+?\d{1,3}[\s-]?\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{4})',
+            html
         )
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
+
+        # Addresses (after common address keywords)
+        addresses = re.findall(
+            r'"([^"]*(?:Road|Street|Avenue|Lane|Dhaka|Chittagong|Sylhet|'
+            r'Rajshahi|Floor|Building|House|Block)[^"]*)"',
+            html, re.IGNORECASE
         )
 
-        # ── Main tab: Google Maps ──
-        maps_page = await context.new_page()
-        url = f"https://www.google.com/maps/search/{search_query.replace(' ', '+')}"
-        await maps_page.goto(url, wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(3)
+        # Ratings
+        ratings = re.findall(r'"(\d\.\d)"', html)
 
-        # Scroll করে সব result load করো
-        for _ in range(12):
+        # Websites
+        websites = re.findall(
+            r'https?://(?!(?:www\.google|maps\.google|goo\.gl|'
+            r'googleapis|facebook|instagram))[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}'
+            r'(?:/[^\s"\'<>]*)?',
+            html
+        )
+        websites = [w for w in websites if 'google' not in w.lower()]
+
+        # Google Maps place links
+        place_links = re.findall(r'(https://www\.google\.com/maps/place/[^\s"\'<>]+)', html)
+
+        # Zip করে lead বানাও
+        max_len = min(max_results, max(len(names), 5))
+
+        for i in range(max_len):
+            lead = {
+                'name':      names[i]     if i < len(names)     else 'N/A',
+                'phone':     phones[i]    if i < len(phones)     else 'N/A',
+                'address':   addresses[i] if i < len(addresses)  else 'N/A',
+                'rating':    ratings[i]   if i < len(ratings)    else 'N/A',
+                'reviews':   'N/A',
+                'website':   websites[i]  if i < len(websites)   else 'N/A',
+                'email':     'N/A',
+                'maps_link': place_links[i] if i < len(place_links) else 'N/A',
+                'category':  'N/A',
+            }
+
+            # Email extract
+            if lead['website'] != 'N/A':
+                lead['email'] = extract_email_from_url(lead['website'])
+                time.sleep(0.5)
+
+            if lead['name'] != 'N/A':
+                results.append(lead)
+
+    except Exception as e:
+        print(f"Scrape error: {e}")
+
+    # Google Maps JavaScript data থেকেও চেষ্টা করো
+    if not results:
+        results = scrape_via_search_api(location, keyword, max_results)
+
+    return results
+
+
+def scrape_via_search_api(location: str, keyword: str, max_results: int) -> list:
+    """Fallback: Google Search থেকে business info নাও"""
+    results = []
+    query = f"{keyword} {location} phone email"
+    encoded = urllib.parse.quote(query)
+    url = f"https://www.google.com/search?q={encoded}&num=20"
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    try:
+        response = session.get(url, timeout=15)
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Business cards from search
+        for div in soup.find_all('div', class_=['VkpGBb', 'rllt__details', 'dbg0pd']):
             try:
-                feed = maps_page.locator('[role="feed"]')
-                await feed.evaluate("el => el.scrollTop += 1500")
-                await asyncio.sleep(1.5)
-            except Exception:
-                break
+                name_el = div.find(['h3', 'span', 'a'])
+                name = name_el.get_text(strip=True) if name_el else 'N/A'
 
-        listings = await maps_page.locator(
-            '[role="feed"] > div > div[jsaction]'
-        ).all()
+                text = div.get_text(separator=' ', strip=True)
 
-        # ── Email এর জন্য আলাদা tab ──
-        email_page = await context.new_page()
+                phone_match = re.search(
+                    r'(\+?8801[3-9]\d{8}|01[3-9]\d{8}|\+?\d[\d\s\-\(\)]{8,})',
+                    text
+                )
+                phone = phone_match.group(1).strip() if phone_match else 'N/A'
 
-        for listing in listings[:max_results]:
-            try:
-                data = {
-                    'name': 'N/A', 'phone': 'N/A', 'address': 'N/A',
-                    'category': 'N/A', 'rating': 'N/A', 'reviews': 'N/A',
-                    'website': 'N/A', 'email': 'N/A', 'maps_link': 'N/A'
-                }
+                emails = clean_emails(re.findall(EMAIL_REGEX, text))
+                email = emails[0] if emails else 'N/A'
 
-                # Business Name
-                name_el = listing.locator(
-                    '.qBF1Pd, .fontHeadlineSmall'
-                ).first
-                if await name_el.count() > 0:
-                    data['name'] = (await name_el.inner_text()).strip()
-
-                # Rating
-                rating_el = listing.locator('.MW4etd').first
-                if await rating_el.count() > 0:
-                    data['rating'] = (await rating_el.inner_text()).strip()
-
-                # Reviews
-                review_el = listing.locator('.UY7F9').first
-                if await review_el.count() > 0:
-                    txt = (await review_el.inner_text()).strip()
-                    data['reviews'] = re.sub(r'[()،,]', '', txt).strip()
-
-                # Category + Address
-                info_els = await listing.locator(
-                    '.W4Efsd span:not([aria-hidden])'
-                ).all()
-                info_texts = []
-                for el in info_els:
-                    txt = (await el.inner_text()).strip()
-                    if txt and txt not in ['·', '']:
-                        info_texts.append(txt)
-                if info_texts:
-                    data['category'] = info_texts[0]
-                if len(info_texts) > 1:
-                    data['address'] = info_texts[1]
-
-                # Detail page: phone + website + maps link
-                try:
-                    await listing.click()
-                    await asyncio.sleep(2.5)
-
-                    # Phone
-                    phone_el = maps_page.locator(
-                        'button[aria-label*="phone"], a[href^="tel:"]'
-                    ).first
-                    if await phone_el.count() > 0:
-                        href = await phone_el.get_attribute('href') or ''
-                        if href.startswith('tel:'):
-                            data['phone'] = href.replace('tel:', '').strip()
-                        else:
-                            aria = await phone_el.get_attribute('aria-label') or ''
-                            data['phone'] = aria.replace('Phone:', '').strip()
-
-                    # Website
-                    web_el = maps_page.locator(
-                        'a[data-item-id="authority"], '
-                        'a[aria-label*="website"], '
-                        '[data-item-id*="website"] a'
-                    ).first
-                    if await web_el.count() > 0:
-                        data['website'] = await web_el.get_attribute('href') or 'N/A'
-
-                    # Maps link
-                    current_url = maps_page.url
-                    if 'maps' in current_url:
-                        data['maps_link'] = current_url
-
-                    # Back
-                    back_btn = maps_page.locator('button[aria-label="Back"]').first
-                    if await back_btn.count() > 0:
-                        await back_btn.click()
-                        await asyncio.sleep(1.5)
-
-                except Exception:
-                    pass
-
-                # ── Email extraction ──
-                if data['website'] != 'N/A':
-                    data['email'] = await extract_email_from_website(
-                        email_page, data['website']
-                    )
-
-                if data['name'] != 'N/A':
-                    results.append(data)
-
+                if name and name != 'N/A':
+                    results.append({
+                        'name': name, 'phone': phone,
+                        'email': email, 'address': 'N/A',
+                        'category': 'N/A', 'rating': 'N/A',
+                        'reviews': 'N/A', 'website': 'N/A',
+                        'maps_link': 'N/A'
+                    })
             except Exception:
                 continue
 
-        await email_page.close()
-        await maps_page.close()
-        await browser.close()
+    except Exception as e:
+        print(f"Search API error: {e}")
 
-    return results
+    return results[:max_results]
 
 
 # ══════════════════════════════════════════════
@@ -276,7 +276,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 *Google Maps Lead Generator*\n\n"
         "আমি Google Maps থেকে business leads বের করি।\n"
         "প্রতিটা lead এ থাকবে:\n"
-        "📌 নাম, ফোন, *ইমেইল*, ঠিকানা, রেটিং, ওয়েবসাইট\n\n"
+        "📌 নাম, ফোন, ইমেইল, ঠিকানা, রেটিং, ওয়েবসাইট\n\n"
         "শুরু করতে /generate লেখো।",
         parse_mode='Markdown'
     )
@@ -316,7 +316,7 @@ async def get_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📋 *Summary*\n\n"
         f"📍 Location : `{loc}`\n"
         f"🔍 Keyword  : `{kw}`\n\n"
-        f"⏱ সময় লাগবে ৩–৮ মিনিট (email extraction এর জন্য)\n"
+        f"⏱ সময় লাগবে ২–৪ মিনিট\n"
         f"শুরু করবো?",
         parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup(keyboard)
@@ -338,25 +338,30 @@ async def confirm_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await query.edit_message_text(
         f"⏳ *Scraping শুরু হয়েছে...*\n\n"
         f"📍 {loc} → 🔍 {kw}\n\n"
-        f"🔄 Google Maps লোড হচ্ছে...\n"
-        f"_(email extraction এ একটু বেশি সময় লাগবে)_",
+        f"🔄 Google Maps থেকে data নিচ্ছি...",
         parse_mode='Markdown'
     )
 
     try:
-        leads = await scrape_google_maps(loc, kw)
+        # Async এর ভেতরে sync function চালাও
+        loop = asyncio.get_event_loop()
+        leads = await loop.run_in_executor(
+            None, scrape_google_maps, loc, kw
+        )
 
         if not leads:
             await context.bot.edit_message_text(
                 chat_id=query.message.chat_id,
                 message_id=msg.message_id,
-                text="😔 কোনো result পাওয়া যায়নি।\nঅন্য keyword বা location দিয়ে চেষ্টা করো।"
+                text=(
+                    "😔 কোনো result পাওয়া যায়নি।\n"
+                    "অন্য keyword বা location দিয়ে চেষ্টা করো।"
+                )
             )
             return ConversationHandler.END
 
-        # Stats বের করো
-        with_email   = sum(1 for l in leads if l['email'] != 'N/A')
-        with_phone   = sum(1 for l in leads if l['phone'] != 'N/A')
+        with_email   = sum(1 for l in leads if l['email']   != 'N/A')
+        with_phone   = sum(1 for l in leads if l['phone']   != 'N/A')
         with_website = sum(1 for l in leads if l['website'] != 'N/A')
 
         csv_path = save_to_csv(leads)
@@ -365,7 +370,7 @@ async def confirm_scraping(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.edit_message_text(
             chat_id=query.message.chat_id,
             message_id=msg.message_id,
-            text=f"✅ *সম্পন্ন! CSV পাঠাচ্ছি...*",
+            text="✅ *সম্পন্ন! CSV পাঠাচ্ছি...*",
             parse_mode='Markdown'
         )
 
@@ -428,8 +433,8 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help",  help_cmd))
+    app.add_handler(CommandHandler("start",  start))
+    app.add_handler(CommandHandler("help",   help_cmd))
     app.add_handler(conv)
 
     print("✅ Bot চালু!")
