@@ -36,11 +36,37 @@ def get_headers():
     }
 
 # ══════════════════════════════════════════════
+#   [NEW] GOOGLE SHEETS ASYNC DATABASE WRAPPER
+# ══════════════════════════════════════════════
+class GoogleSheetsDB:
+    """Handles all database operations asynchronously so it doesn't slow down the scraper."""
+    def __init__(self, webhook_url):
+        self.url = webhook_url
+
+    def _post_async(self, payload):
+        try:
+            requests.post(self.url, json=payload, timeout=15)
+        except Exception as e:
+            pass # Fail silently in background to prevent crashing
+
+    def send_action(self, action, data):
+        if not self.url: return
+        payload = {"action": action, "data": data}
+        # Fire and forget thread
+        threading.Thread(target=self._post_async, args=(payload,), daemon=True).start()
+
+    def log(self, action, details):
+        self.send_action("log", {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "action": action,
+            "details": details
+        })
+
+# ══════════════════════════════════════════════
 #   1. SUPER FAST PURE PYTHON SCRAPER
 # ══════════════════════════════════════════════
 class GoogleMapsScraper:
     def fetch_batch(self, keyword, location):
-        """Fetches multiple pages concurrently for blazing fast speed."""
         query = urllib.parse.quote_plus(f"{keyword} in {location}")
         all_leads = []
         
@@ -96,7 +122,7 @@ class GoogleMapsScraper:
         return all_leads
 
 # ══════════════════════════════════════════════
-#   2. DEEP EMAIL EXTRACTOR (TONNO TONNO KORE KHOJA)
+#   2. DEEP EMAIL EXTRACTOR
 # ══════════════════════════════════════════════
 class DeepEmailExtractor:
     def __init__(self):
@@ -114,7 +140,6 @@ class DeepEmailExtractor:
         visited_urls = set()
         
         try:
-            # Step 1: Check Homepage
             r = requests.get(url, headers=get_headers(), timeout=6, verify=False)
             visited_urls.add(url)
             
@@ -122,7 +147,6 @@ class DeepEmailExtractor:
             valid_emails = [e for e in emails if self.is_valid_email(e)]
             if valid_emails: return valid_emails[0]
             
-            # Step 2: Find Internal Links (Contact, About, Support)
             soup = BeautifulSoup(r.text, 'html.parser')
             internal_links = []
             for a in soup.select('a[href]'):
@@ -132,7 +156,6 @@ class DeepEmailExtractor:
                     if full_link not in visited_urls and full_link.startswith('http'):
                         internal_links.append(full_link)
             
-            # Step 3: Visit up to 3 internal pages to find email
             for link in list(set(internal_links))[:3]:
                 try:
                     r2 = requests.get(link, headers=get_headers(), timeout=6, verify=False)
@@ -154,8 +177,8 @@ def generate_ai_keywords(base_kw, location, used_kws):
     if not GROQ_API_KEY: return fallback
     try:
         client = Groq(api_key=GROQ_API_KEY)
-        # Asking for 30 keywords at a time to ensure we have a massive pool to search from
-        prompt = f"I am searching for '{base_kw}' in '{location}'. Used keywords: {list(used_kws)}. Generate 30 NEW, highly related search terms/categories. Return ONLY a comma-separated list."
+        # UPGRADED: Now asks for 100+ keywords to ensure massive pool
+        prompt = f"I am searching for '{base_kw}' in '{location}'. Used keywords: {list(used_kws)}. Generate 100 NEW, highly related search terms/categories. Return ONLY a comma-separated list."
         res = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama3-8b-8192",
@@ -167,19 +190,23 @@ def generate_ai_keywords(base_kw, location, used_kws):
     except:
         return fallback
 
-def personalize_email(lead_name, niche, template_subject, template_body):
-    if not GROQ_API_KEY: return template_subject, template_body
+def personalize_email(lead_name, niche, template_subject, template_body, rating):
+    if not GROQ_API_KEY: return template_subject, template_body, ""
     try:
         client = Groq(api_key=GROQ_API_KEY)
+        # UPGRADED: Now generates a specific personalization line based on rating/niche
         prompt = f"""
-        You are an expert copywriter. Personalize this email for a business.
+        You are an expert cold email copywriter. Personalize this email for a business.
         Business Name: {lead_name}
         Niche: {niche}
+        Current Rating: {rating} (If below 4.0, mention helping them improve it. If high, compliment it).
         Original Subject: {template_subject}
         Original Body: {template_body}
         
-        Return ONLY a valid JSON object with keys "subject" and "body".
-        Ensure the body uses HTML formatting (<br>, <b>, etc.). Do not include markdown blocks.
+        Return ONLY a valid JSON object with keys:
+        "subject" (personalized subject),
+        "body" (personalized HTML body),
+        "personalization_line" (A single, highly personalized opening sentence based on their business and rating).
         """
         res = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
@@ -190,13 +217,13 @@ def personalize_email(lead_name, niche, template_subject, template_body):
         json_match = re.search(r'\{.*\}', content, re.DOTALL)
         if json_match:
             data = json.loads(json_match.group(0))
-            return data.get("subject", template_subject), data.get("body", template_body)
-        return template_subject, template_body
+            return data.get("subject", template_subject), data.get("body", template_body), data.get("personalization_line", "")
+        return template_subject, template_body, ""
     except Exception as e:
-        return template_subject, template_body
+        return template_subject, template_body, ""
 
 # ══════════════════════════════════════════════
-#   4. MASTER EXECUTION THREAD (Scrape + Email)
+#   4. MASTER EXECUTION THREAD (Scrape + DB + Email)
 # ══════════════════════════════════════════════
 def run_job_thread(job_id, data):
     try:
@@ -205,26 +232,39 @@ def run_job_thread(job_id, data):
         max_leads = min(int(data.get('max_leads', 10)), 200)
         max_rating = data.get('max_rating')
         webhook_url = data.get('webhook_url')
+        db_webhook_url = data.get('db_webhook_url') # NEW: DB Webhook
         templates = data.get('templates', [])
         
         maps_scraper = GoogleMapsScraper()
         email_lib = DeepEmailExtractor()
+        db = GoogleSheetsDB(db_webhook_url)
         
         jobs[job_id] = {'status': 'scraping', 'count': 0, 'leads': [], 'status_text': 'Starting AI Keyword Generation...'}
         
+        # [DB] Initialize Sheets & Config
+        if db_webhook_url:
+            db.send_action("init", {})
+            db.send_action("update_config", {
+                "keyword_seed": base_keyword, "location": location, "target_leads": max_leads,
+                "min_rating": "", "max_rating": max_rating or "", "email_required": "true", "status": "running"
+            })
+            db.log("System Start", f"Started job for {base_keyword} in {location}")
+
         seen_names = set()
         used_keywords = set()
         pending_keywords = [base_keyword]
         
         # --- PHASE 1: STRICT SCRAPING (UNTIL TARGET HIT) ---
-        # The loop will continue running until len(leads) == max_leads
         while len(jobs[job_id]['leads']) < max_leads:
             
-            # If we run out of keywords, generate 30 more!
             if not pending_keywords:
-                jobs[job_id]['status_text'] = f"Generating 30+ new keywords for '{base_keyword}'..."
+                jobs[job_id]['status_text'] = f"Generating 100+ new keywords for '{base_keyword}'..."
                 new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
                 pending_keywords.extend(new_kws)
+                
+                # [DB] Save generated keywords
+                for kw in new_kws:
+                    db.send_action("add_keyword", {"keyword": kw, "source_seed": base_keyword, "status": "pending"})
                 
             current_kw = pending_keywords.pop(0)
             used_keywords.add(current_kw.lower())
@@ -233,17 +273,22 @@ def run_job_thread(job_id, data):
             raw_leads = maps_scraper.fetch_batch(current_kw, location)
             
             if not raw_leads:
-                continue # If no results for this keyword, immediately try the next one
+                continue 
             
-            # Process the leads found for this keyword one by one
             for lead in raw_leads:
-                # TARGET HIT CHECK: Stop immediately if we reached the goal
                 if len(jobs[job_id]['leads']) >= max_leads:
-                    break 
+                    break # Target Hit!
                     
                 if lead['Name'] in seen_names:
                     continue
-                    
+                
+                # [DB] Save raw scraped business
+                db.send_action("add_scraped", {
+                    "business_name": lead['Name'], "address": lead['Address'], "phone": lead['Phone'],
+                    "rating": lead['Rating'], "review_count": "N/A", "website": lead['Website'],
+                    "keyword": current_kw, "status": "scraped"
+                })
+
                 # Apply Rating Filter
                 if max_rating and lead['Rating'] != "N/A":
                     try:
@@ -251,18 +296,26 @@ def run_job_thread(job_id, data):
                     except: pass
 
                 if lead['Website'] == "N/A":
-                    continue # Skip if no website to find email
-                    
-                jobs[job_id]['status_text'] = f"Deep searching email for: {lead['Name']}..."
-                
-                # Extract Email (Deep Search inside the website)
-                extracted_email = email_lib.get_email(lead['Website'])
-                
-                # STRICT MODE: If no email found, DISCARD the lead and move to the next.
-                if extracted_email == "N/A":
                     continue 
                     
-                # SUCCESS! Email found. Add to our final list.
+                jobs[job_id]['status_text'] = f"Deep searching email for: {lead['Name']}..."
+                extracted_email = email_lib.get_email(lead['Website'])
+                
+                if extracted_email == "N/A":
+                    continue 
+                
+                # [DB] Save Email Lead
+                db.send_action("add_email_lead", {
+                    "business_name": lead['Name'], "website": lead['Website'],
+                    "email": extracted_email, "source_page": lead['Website'], "status": "qualified"
+                })
+                
+                # [DB] Move to Qualified Leads
+                db.send_action("add_qualified", {
+                    "business_name": lead['Name'], "email": extracted_email, "website": lead['Website'],
+                    "rating": lead['Rating'], "keyword": current_kw, "personalization_line": "Pending AI...", "email_sent": "no"
+                })
+
                 lead['Email'] = extracted_email
                 seen_names.add(lead['Name'])
                 jobs[job_id]['leads'].append(lead)
@@ -274,7 +327,14 @@ def run_job_thread(job_id, data):
             
         final_leads = jobs[job_id]['leads']
         
-        # --- PHASE 2: AUTOMATED EMAIL SENDING (1-2 Min Delay) ---
+        # [DB] Update Config to Stopped
+        db.send_action("update_config", {
+            "keyword_seed": base_keyword, "location": location, "target_leads": max_leads,
+            "min_rating": "", "max_rating": max_rating or "", "email_required": "true", "status": "stopped"
+        })
+        db.log("Scraping Stopped", f"Target reached. Total qualified: {len(final_leads)}")
+        
+        # --- PHASE 2: AUTOMATED EMAIL SENDING ---
         if webhook_url and templates and len(final_leads) > 0:
             jobs[job_id]['status'] = 'sending_emails'
             jobs[job_id]['total_to_send'] = len(final_leads)
@@ -284,17 +344,21 @@ def run_job_thread(job_id, data):
                 jobs[job_id]['status_text'] = f"Sending personalized email {emails_sent+1}/{jobs[job_id]['total_to_send']} to {lead['Email']}..."
                 
                 template = random.choice(templates)
-                p_subject, p_body = personalize_email(lead['Name'], base_keyword, template['subject'], template['body'])
+                # UPGRADED: Now generates personalization line
+                p_subject, p_body, p_line = personalize_email(lead['Name'], base_keyword, template['subject'], template['body'], lead['Rating'])
                 
                 payload = {"to": lead['Email'], "subject": p_subject, "body": p_body}
                 try:
                     requests.post(webhook_url, json=payload, timeout=10)
                     emails_sent += 1
                     jobs[job_id]['emails_sent'] = emails_sent
+                    
+                    # [DB] Update Email Sent Status & Personalization Line
+                    db.send_action("update_email_sent", {"email": lead['Email'], "personalization_line": p_line})
+                    db.log("Email Sent", f"Sent to {lead['Email']}")
                 except Exception as e:
                     print(f"Failed to send email to {lead['Email']}: {e}")
                 
-                # 1 to 2 minutes delay between emails (60 to 120 seconds)
                 if emails_sent < jobs[job_id]['total_to_send']:
                     delay = random.randint(60, 120)
                     for i in range(delay, 0, -1):
@@ -304,9 +368,11 @@ def run_job_thread(job_id, data):
         # --- FINISHED ---
         jobs[job_id]['status'] = 'done'
         jobs[job_id]['status_text'] = 'Process Completed Successfully!'
+        db.log("Job Complete", "All tasks finished successfully.")
         
     except Exception as e:
         jobs[job_id] = {'status': 'error', 'error': str(e)}
+        if 'db' in locals(): db.log("Error", str(e))
 
 # ══════════════════════════════════════════════
 #   FLASK DASHBOARD & API
@@ -319,7 +385,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LeadGen Pro | Auto Emailer</title>
+<title>LeadGen Pro | Auto Emailer & DB</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
 <style>
@@ -333,6 +399,8 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
 .btn-p:disabled{opacity:.45;cursor:not-allowed;transform:none;filter:none}
 .btn-g{background:linear-gradient(135deg,#059669,#0d9488);color:#fff;font-weight:600;cursor:pointer;transition:all .2s;border:none}
 .btn-g:hover{filter:brightness(1.12);transform:translateY(-1px);box-shadow:0 6px 20px rgba(5,150,105,0.4)}
+.btn-b{background:linear-gradient(135deg,#2563eb,#3b82f6);color:#fff;font-weight:600;cursor:pointer;transition:all .2s;border:none}
+.btn-b:hover{filter:brightness(1.12);transform:translateY(-1px);box-shadow:0 6px 20px rgba(37,99,235,0.4)}
 .inp{background:#0f172a;border:1px solid #1e293b;color:#e2e8f0;border-radius:10px;padding:11px 15px;font-size:13px;width:100%;transition:border .2s;outline:none}
 .inp:focus{border-color:#4f46e5;box-shadow:0 0 0 3px rgba(79,70,229,0.12)}
 .tab{border-radius:9px;padding:9px 18px;font-size:12px;font-weight:600;cursor:pointer;transition:all .2s;border:1px solid transparent;color:#64748b;background:transparent}
@@ -360,7 +428,7 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
     <div class="btn-p w-9 h-9 rounded-xl flex items-center justify-center text-sm shadow-lg"><i class="fa-solid fa-bolt"></i></div>
     <div>
       <div class="font-bold text-white text-sm">LeadGen Pro <span class="text-indigo-400">Auto</span></div>
-      <div class="text-xs text-slate-500">Scrape & Send Personalized Emails</div>
+      <div class="text-xs text-slate-500">Scrape, Store & Send Personalized Emails</div>
     </div>
   </div>
 </nav>
@@ -378,7 +446,8 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
   <!-- TABS -->
   <div class="flex gap-2 mb-5 overflow-x-auto pb-1">
     <button class="tab on" id="tab-search" onclick="showTab('search')"><i class="fa-solid fa-search mr-1.5"></i>Search & Run</button>
-    <button class="tab" id="tab-connect" onclick="showTab('connect')"><i class="fa-solid fa-link mr-1.5"></i>Connect Email</button>
+    <button class="tab" id="tab-database" onclick="showTab('database')"><i class="fa-solid fa-database mr-1.5"></i>Connect Database</button>
+    <button class="tab" id="tab-connect" onclick="showTab('connect')"><i class="fa-solid fa-paper-plane mr-1.5"></i>Connect Email</button>
     <button class="tab" id="tab-templates" onclick="showTab('templates')"><i class="fa-solid fa-envelope-open-text mr-1.5"></i>Templates</button>
     <button class="tab" id="tab-history" onclick="showTab('history')"><i class="fa-solid fa-history mr-1.5"></i>History</button>
   </div>
@@ -433,11 +502,115 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
     </div>
   </div>
 
+  <!-- [NEW] DATABASE PANE -->
+  <div id="pane-database" class="hidden fade">
+    <div class="card p-6">
+      <h2 class="font-bold text-white text-sm mb-4"><i class="fa-solid fa-database text-blue-400 mr-2"></i>Connect Google Sheets Database</h2>
+      <p class="text-xs text-slate-400 mb-4 leading-relaxed">
+        Store all generated keywords, scraped businesses, emails, and logs automatically in Google Sheets.<br>
+        1. Go to <a href="https://script.google.com" target="_blank" class="text-blue-400 underline">script.google.com</a> and create a New Project.<br>
+        2. Copy and paste the script below.<br>
+        3. Click <b>Deploy > New Deployment</b>. Select type <b>Web app</b>.<br>
+        4. Set "Who has access" to <b>Anyone</b>. Click Deploy and copy the Web App URL.
+      </p>
+      
+      <div class="relative mb-5">
+        <button onclick="copyScript()" class="absolute top-2 right-2 bg-slate-800 hover:bg-slate-700 text-white text-xs py-1 px-3 rounded border border-slate-600 transition-colors z-10">Copy Script</button>
+        <textarea id="db-script-code" readonly class="inp font-mono text-xs h-48" style="color:#93c5fd">
+function doPost(e) {
+  var lock = LockService.getScriptLock();
+  lock.tryLock(10000);
+  try {
+    var payload = JSON.parse(e.postData.contents);
+    var action = payload.action;
+    var data = payload.data;
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+    function getOrCreateSheet(name, headers) {
+      var sheet = ss.getSheetByName(name);
+      if (!sheet) {
+        sheet = ss.insertSheet(name);
+        sheet.appendRow(headers);
+        sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+      }
+      return sheet;
+    }
+
+    if (action === "init") {
+      getOrCreateSheet("Config", ["keyword_seed", "location", "target_leads", "min_rating", "max_rating", "email_required", "status"]);
+      getOrCreateSheet("Generated_Keywords", ["keyword", "source_seed", "status"]);
+      getOrCreateSheet("Scraped_Businesses", ["business_name", "address", "phone", "rating", "review_count", "website", "keyword", "status"]);
+      getOrCreateSheet("Email_Leads", ["business_name", "website", "email", "source_page", "status"]);
+      getOrCreateSheet("Qualified_Leads", ["business_name", "email", "website", "rating", "keyword", "personalization_line", "email_sent"]);
+      getOrCreateSheet("Logs", ["timestamp", "action", "details"]);
+      return ContentService.createTextOutput(JSON.stringify({status: "success"})).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    if (action === "log") {
+      var sheet = ss.getSheetByName("Logs");
+      if(sheet) sheet.appendRow([data.timestamp, data.action, data.details]);
+    }
+    else if (action === "add_keyword") {
+      var sheet = ss.getSheetByName("Generated_Keywords");
+      if(sheet) sheet.appendRow([data.keyword, data.source_seed, data.status]);
+    }
+    else if (action === "add_scraped") {
+      var sheet = ss.getSheetByName("Scraped_Businesses");
+      if(sheet) sheet.appendRow([data.business_name, data.address, data.phone, data.rating, data.review_count, data.website, data.keyword, data.status]);
+    }
+    else if (action === "add_email_lead") {
+      var sheet = ss.getSheetByName("Email_Leads");
+      if(sheet) sheet.appendRow([data.business_name, data.website, data.email, data.source_page, data.status]);
+    }
+    else if (action === "add_qualified") {
+      var sheet = ss.getSheetByName("Qualified_Leads");
+      if(sheet) sheet.appendRow([data.business_name, data.email, data.website, data.rating, data.keyword, data.personalization_line, data.email_sent]);
+    }
+    else if (action === "update_config") {
+       var sheet = ss.getSheetByName("Config");
+       if(sheet) {
+         sheet.clearContents();
+         sheet.appendRow(["keyword_seed", "location", "target_leads", "min_rating", "max_rating", "email_required", "status"]);
+         sheet.appendRow([data.keyword_seed, data.location, data.target_leads, data.min_rating, data.max_rating, data.email_required, data.status]);
+       }
+    }
+    else if (action === "update_email_sent") {
+       var sheet = ss.getSheetByName("Qualified_Leads");
+       if(sheet) {
+         var dataRange = sheet.getDataRange();
+         var values = dataRange.getValues();
+         for (var i = 1; i < values.length; i++) {
+           if (values[i][1] === data.email) { 
+             sheet.getRange(i + 1, 6).setValue(data.personalization_line);
+             sheet.getRange(i + 1, 7).setValue("yes");
+             break;
+           }
+         }
+       }
+    }
+    return ContentService.createTextOutput(JSON.stringify({status: "success"})).setMimeType(ContentService.MimeType.JSON);
+  } catch(e) {
+    return ContentService.createTextOutput(JSON.stringify({status: "error", message: e.toString()})).setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    lock.releaseLock();
+  }
+}
+function doGet(e) {
+  return ContentService.createTextOutput(JSON.stringify({status: "active", message: "Database Connected"})).setMimeType(ContentService.MimeType.JSON);
+}</textarea>
+      </div>
+      
+      <label class="text-xs text-slate-500 mb-1.5 block">🔗 Paste Database Web App URL Here:</label>
+      <input id="db-webhook-url" class="inp mb-4" placeholder="https://script.google.com/macros/s/AKfycb.../exec">
+      <button onclick="saveDBWebhook()" class="btn-b w-full py-2.5 rounded-xl text-sm"><i class="fa-solid fa-link mr-2"></i>Connect Database</button>
+    </div>
+  </div>
+
   <!-- CONNECT EMAIL PANE -->
   <div id="pane-connect" class="hidden fade">
     <div class="card p-6">
-      <h2 class="font-bold text-white text-sm mb-4"><i class="fa-solid fa-plug text-indigo-400 mr-2"></i>Google Apps Script Setup</h2>
-      <p class="text-xs text-slate-400 mb-4 leading-relaxed">To send emails automatically from your Gmail, follow these steps:<br>1. Go to <a href="https://script.google.com" target="_blank" class="text-indigo-400 underline">script.google.com</a> and create a New Project.<br>2. Paste the code below.<br>3. Click <b>Deploy > New Deployment</b>. Select type <b>Web app</b>.<br>4. Set "Who has access" to <b>Anyone</b>. Click Deploy and copy the Web App URL.</p>
+      <h2 class="font-bold text-white text-sm mb-4"><i class="fa-solid fa-paper-plane text-emerald-400 mr-2"></i>Google Apps Script Setup (Email Sender)</h2>
+      <p class="text-xs text-slate-400 mb-4 leading-relaxed">To send emails automatically from your Gmail, follow these steps:<br>1. Go to <a href="https://script.google.com" target="_blank" class="text-emerald-400 underline">script.google.com</a> and create a New Project.<br>2. Paste the code below.<br>3. Click <b>Deploy > New Deployment</b>. Select type <b>Web app</b>.<br>4. Set "Who has access" to <b>Anyone</b>. Click Deploy and copy the Web App URL.</p>
       
       <div class="relative mb-5">
         <textarea readonly class="inp font-mono text-xs h-32" style="color:#a5b4fc">
@@ -456,9 +629,9 @@ function doPost(e) {
 }</textarea>
       </div>
       
-      <label class="text-xs text-slate-500 mb-1.5 block">🔗 Paste Web App URL Here:</label>
+      <label class="text-xs text-slate-500 mb-1.5 block">🔗 Paste Email Web App URL Here:</label>
       <input id="webhook-url" class="inp mb-4" placeholder="https://script.google.com/macros/s/AKfycb.../exec">
-      <button onclick="saveWebhook()" class="btn-g w-full py-2.5 rounded-xl text-sm"><i class="fa-solid fa-save mr-2"></i>Save Connection</button>
+      <button onclick="saveWebhook()" class="btn-g w-full py-2.5 rounded-xl text-sm"><i class="fa-solid fa-save mr-2"></i>Save Email Connection</button>
     </div>
   </div>
 
@@ -495,6 +668,7 @@ let jid=null, templates=[], historyData=[], tableShown=false;
 
 window.onload=()=>{
   document.getElementById('webhook-url').value = localStorage.getItem('webhook_url') || '';
+  document.getElementById('db-webhook-url').value = localStorage.getItem('db_webhook_url') || '';
   templates = JSON.parse(localStorage.getItem('templates') || '[]');
   historyData = JSON.parse(localStorage.getItem('history') || '[]');
   renderTemplates();
@@ -502,7 +676,7 @@ window.onload=()=>{
 };
 
 function showTab(t){
-  ['search','connect','templates','history'].forEach(x=>{
+  ['search','database','connect','templates','history'].forEach(x=>{
     document.getElementById('pane-'+x).classList.add('hidden');
     document.getElementById('tab-'+x).classList.remove('on');
   });
@@ -510,9 +684,21 @@ function showTab(t){
   document.getElementById('tab-'+t).classList.add('on');
 }
 
+function copyScript() {
+  const code = document.getElementById('db-script-code');
+  code.select();
+  document.execCommand('copy');
+  alert("Database Script Copied!");
+}
+
 function saveWebhook(){
   localStorage.setItem('webhook_url', document.getElementById('webhook-url').value.trim());
-  alert("Webhook Saved Successfully!");
+  alert("Email Webhook Saved Successfully!");
+}
+
+function saveDBWebhook(){
+  localStorage.setItem('db_webhook_url', document.getElementById('db-webhook-url').value.trim());
+  alert("Database Webhook Saved Successfully!");
 }
 
 function addTemplate(){
@@ -567,7 +753,7 @@ function setSt(msg, state='load', pct=null){
 
 function updStats(leads){
   document.getElementById('st').textContent=leads.length;
-  document.getElementById('se').textContent=leads.length; // All leads now have emails
+  document.getElementById('se').textContent=leads.length; 
   document.getElementById('sp').textContent=leads.filter(l=>l.Phone&&l.Phone!='N/A').length;
   document.getElementById('sw').textContent=leads.filter(l=>l.Website&&l.Website!='N/A').length;
 }
@@ -596,7 +782,10 @@ async function startJob(){
   if(!loc||!kw) return alert('Location & Keyword required!');
   
   const webhook = document.getElementById('webhook-url').value.trim();
-  if(!webhook && templates.length > 0) alert("Warning: Webhook URL is missing. Emails will NOT be sent.");
+  const db_webhook = document.getElementById('db-webhook-url').value.trim();
+  
+  if(!db_webhook) alert("Notice: Database Webhook is missing. Data will not be saved to Google Sheets.");
+  if(!webhook && templates.length > 0) alert("Warning: Email Webhook URL is missing. Emails will NOT be sent.");
   if(webhook && templates.length === 0) alert("Warning: No templates added. Emails will NOT be sent.");
 
   setSt('Initializing AI Search Engine...','load',5);
@@ -608,7 +797,7 @@ async function startJob(){
   const payload = {
     location: loc, keyword: kw, max_leads: count,
     max_rating: document.getElementById('m-rating').value || null,
-    webhook_url: webhook, templates: templates
+    webhook_url: webhook, db_webhook_url: db_webhook, templates: templates
   };
 
   try {
@@ -762,7 +951,6 @@ async def m_rating(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def run_bot_scrape_fast(data):
-    """Runs the fast pure python scraper for the Telegram Bot."""
     location = data['loc']
     base_keyword = data['kw']
     max_leads = data['count']
