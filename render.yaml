@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web
     name: maps-lead-bot
     runtime: python
     pythonVersion: "3.11.9"
@@ -7,4 +7,6 @@ services:
     startCommand: python main.py
     envVars:
       - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: APIFY_API_TOKEN
         sync: false
