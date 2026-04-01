@@ -22,8 +22,7 @@ CONFIG = {
 # ══════════════════════════════════════════════
 class GoogleMapsScraper:
     """
-    Acts exactly like a Python Library (e.g., google-play-scraper).
-    Uses Google Local Search (tbm=lcl) to bypass JS rendering and blocks.
+    Fetches raw pages from Google Local Search.
     """
     def __init__(self):
         self.headers = {
@@ -31,77 +30,65 @@ class GoogleMapsScraper:
             "Accept-Language": "en-US,en;q=0.9"
         }
 
-    def search(self, keyword, location, max_results=100, max_rating=None):
+    def get_page(self, keyword, location, start, max_rating=None):
         results = []
-        seen_names = set()
         query = urllib.parse.quote(f"{keyword} in {location}")
+        url = f"https://www.google.com/search?q={query}&tbm=lcl&start={start}"
         
-        # Google shows 20 results per page in Local Search
-        for start in range(0, int(max_results), 20):
-            url = f"https://www.google.com/search?q={query}&tbm=lcl&start={start}"
+        try:
+            res = requests.get(url, headers=self.headers, timeout=15)
+            soup = BeautifulSoup(res.text, 'html.parser')
             
-            try:
-                res = requests.get(url, headers=self.headers, timeout=15)
-                soup = BeautifulSoup(res.text, 'html.parser')
+            # Find all business blocks
+            places = soup.find_all('div', class_=['VkpGBb', 'rllt__details', 'dbg0pd'])
+            
+            if not places:
+                return []
                 
-                # Find all business blocks
-                places = soup.find_all('div', class_=['VkpGBb', 'rllt__details', 'dbg0pd'])
+            for place in places:
+                # Extract Name
+                name_tag = place.find(['div', 'h3', 'span'], class_='dbg0pd') or place.find('div', role='heading')
+                name = name_tag.get_text(strip=True) if name_tag else "N/A"
                 
-                if not places:
-                    break # No more pages
+                if name == "N/A" or len(name) < 3:
+                    continue
                     
-                for place in places:
-                    # Extract Name
-                    name_tag = place.find(['div', 'h3', 'span'], class_='dbg0pd') or place.find('div', role='heading')
-                    name = name_tag.get_text(strip=True) if name_tag else "N/A"
-                    
-                    if name == "N/A" or name in seen_names or len(name) < 3:
-                        continue
-                        
-                    # Extract full text snippet for Regex parsing
-                    text_content = place.get_text(separator=' ', strip=True)
-                    
-                    # Extract Rating
-                    rating_match = re.search(r'(\d\.\d)\s*\(', text_content)
-                    rating = rating_match.group(1) if rating_match else "N/A"
-                    
-                    if max_rating and rating != "N/A" and float(rating) > float(max_rating):
-                        continue
-                        
-                    # Extract Phone
-                    phone_match = re.search(r'(\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}', text_content)
-                    phone = phone_match.group(0) if phone_match else "N/A"
-                    
-                    # Extract Website
-                    website = "N/A"
-                    for a in place.find_all('a', href=True):
-                        href = a['href']
-                        if '/url?q=' in href and 'google.com' not in href:
-                            website = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
-                            break
-                        elif href.startswith('http') and 'google.com' not in href:
-                            website = href
-                            break
-                            
-                    seen_names.add(name)
-                    results.append({
-                        "Name": name,
-                        "Phone": phone,
-                        "Website": website,
-                        "Rating": rating,
-                        "Address": location,
-                        "Category": keyword,
-                        "Maps_Link": f"https://www.google.com/maps/search/{urllib.parse.quote(name + ' ' + location)}"
-                    })
-                    
-                    if len(results) >= int(max_results):
-                        return results
-                        
-                time.sleep(1) # Anti-block delay between pages
-            except Exception as e:
-                print(f"Library Error: {e}")
-                break
+                text_content = place.get_text(separator=' ', strip=True)
                 
+                # Extract Rating
+                rating_match = re.search(r'(\d\.\d)\s*\(', text_content)
+                rating = rating_match.group(1) if rating_match else "N/A"
+                
+                if max_rating and rating != "N/A" and float(rating) > float(max_rating):
+                    continue
+                    
+                # Extract Phone
+                phone_match = re.search(r'(\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}', text_content)
+                phone = phone_match.group(0) if phone_match else "N/A"
+                
+                # Extract Website
+                website = "N/A"
+                for a in place.find_all('a', href=True):
+                    href = a['href']
+                    if '/url?q=' in href and 'google.com' not in href:
+                        website = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
+                        break
+                    elif href.startswith('http') and 'google.com' not in href:
+                        website = href
+                        break
+                        
+                results.append({
+                    "Name": name,
+                    "Phone": phone,
+                    "Website": website,
+                    "Rating": rating,
+                    "Address": location,
+                    "Category": keyword,
+                    "Maps_Link": f"https://www.google.com/maps/search/{urllib.parse.quote(name + ' ' + location)}"
+                })
+        except Exception as e:
+            pass
+            
         return results
 
 # ══════════════════════════════════════════════
@@ -136,27 +123,50 @@ class DeepEmailExtractor:
         return "N/A"
 
 # ══════════════════════════════════════════════
-#   3. MASTER EXECUTION FUNCTION
+#   3. MASTER EXECUTION FUNCTION (Target Guarantee Engine)
 # ══════════════════════════════════════════════
-def run_full_scraper(location, keyword, max_leads=100, max_rating=None):
+def run_full_scraper(location, keyword, max_leads=50, max_rating=None):
     maps_lib = GoogleMapsScraper()
     email_lib = DeepEmailExtractor()
     
-    # 1. Get Leads from Google Local
-    raw_leads = maps_lib.search(keyword, location, max_leads, max_rating)
-    
-    # 2. Enrich with Emails and Filter Quality
     final_leads = []
-    for lead in raw_leads:
-        if lead['Website'] != 'N/A':
-            lead['Email'] = email_lib.get_email(lead['Website'])
+    seen_names = set()
+    start = 0
+    empty_strikes = 0
+    max_leads = int(max_leads)
+    
+    # এটি লুপ করতে থাকবে যতক্ষণ না লিমিট পূরণ হয় (অথবা ৮০০ রেজাল্ট পর্যন্ত)
+    while len(final_leads) < max_leads and start <= 800:
+        raw_batch = maps_lib.get_page(keyword, location, start, max_rating)
+        
+        if not raw_batch:
+            empty_strikes += 1
+            if empty_strikes >= 3:
+                break # গুগলের কাছে আর ডাটা নেই
         else:
-            lead['Email'] = "N/A"
+            empty_strikes = 0
             
-        # Quality Check: Keep only if it has Phone or Email or Website
-        if lead['Phone'] != 'N/A' or lead['Email'] != 'N/A' or lead['Website'] != 'N/A':
-            final_leads.append(lead)
-            
+        for lead in raw_batch:
+            if len(final_leads) >= max_leads:
+                break
+                
+            if lead['Name'] in seen_names:
+                continue
+                
+            # Enrich Email on the fly
+            if lead['Website'] != 'N/A':
+                lead['Email'] = email_lib.get_email(lead['Website'])
+            else:
+                lead['Email'] = "N/A"
+                
+            # Quality Check: Keep only if it has Phone or Email or Website
+            if lead['Phone'] != 'N/A' or lead['Email'] != 'N/A' or lead['Website'] != 'N/A':
+                seen_names.add(lead['Name'])
+                final_leads.append(lead)
+                
+        start += 20
+        time.sleep(1.5) # Anti-block delay between page requests
+        
     return final_leads
 
 # ══════════════════════════════════════════════
@@ -172,13 +182,13 @@ def parse_with_ai(user_text):
     Extract the following details from the user's input:
     - loc: The location (e.g., Vancouver, Dhaka, Texas)
     - kw: The niche or keyword (e.g., car showroom, plumber)
-    - count: Number of leads requested (integer, default is 100)
+    - count: Number of leads requested (integer, default is 50)
     - rating: Maximum rating requested (float, e.g., 3.0, 4.5)
 
     User input: "{user_text}"
 
     Return ONLY a valid JSON object. Do not include any other text.
-    Example format: {{"loc": "Vancouver", "kw": "car showroom", "count": 100, "rating": 3.0}}
+    Example format: {{"loc": "Vancouver", "kw": "car showroom", "count": 50, "rating": 3.0}}
     """
     try:
         chat_completion = client.chat.completions.create(
@@ -191,272 +201,390 @@ def parse_with_ai(user_text):
         if json_match: return json.loads(json_match.group(0))
         return json.loads(response)
     except Exception as e:
-        raise Exception("Failed to connect to Groq AI. Please check your API Key in Settings.")
+        raise Exception("Failed to connect to Groq AI. Check API Key.")
 
 # ══════════════════════════════════════════════
-#   WEB DASHBOARD (FLASK + DARK TAILWIND CSS)
+#   WEB DASHBOARD (FLASK + DARK UI)
 # ══════════════════════════════════════════════
 flask_app = Flask(__name__)
 jobs = {}
 
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en" class="dark">
+# New UI HTML exactly as requested
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pro Lead Gen Agent (Python Library Edition)</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-    <script>
-        tailwind.config = {
-            darkMode: 'class',
-            theme: {
-                extend: {
-                    colors: {
-                        darkbg: '#0f172a',
-                        darkcard: '#1e293b',
-                        darkinput: '#334155',
-                    }
-                }
-            }
-        }
-    </script>
-    <style>
-        ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-track { background: #1e293b; }
-        ::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: #64748b; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LeadGen Pro</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+<style>
+*{box-sizing:border-box}
+body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;min-height:100vh}
+.card{background:rgba(15,23,42,0.85);border:1px solid rgba(99,102,241,0.12);border-radius:16px}
+.card-hover{transition:all .2s}
+.card-hover:hover{border-color:rgba(99,102,241,0.35);transform:translateY(-2px)}
+.btn-p{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;font-weight:600;cursor:pointer;transition:all .2s;border:none}
+.btn-p:hover{filter:brightness(1.12);transform:translateY(-1px);box-shadow:0 6px 20px rgba(79,70,229,0.4)}
+.btn-p:disabled{opacity:.45;cursor:not-allowed;transform:none;filter:none}
+.btn-g{background:linear-gradient(135deg,#059669,#0d9488);color:#fff;font-weight:600;cursor:pointer;transition:all .2s;border:none}
+.btn-g:hover{filter:brightness(1.12);transform:translateY(-1px);box-shadow:0 6px 20px rgba(5,150,105,0.4)}
+.inp{background:#0f172a;border:1px solid #1e293b;color:#e2e8f0;border-radius:10px;padding:11px 15px;font-size:13px;width:100%;transition:border .2s;outline:none}
+.inp:focus{border-color:#4f46e5;box-shadow:0 0 0 3px rgba(79,70,229,0.12)}
+.tab{border-radius:9px;padding:9px 18px;font-size:12px;font-weight:600;cursor:pointer;transition:all .2s;border:1px solid transparent;color:#64748b;background:transparent}
+.tab.on{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;box-shadow:0 3px 12px rgba(79,70,229,0.35)}
+.tab:not(.on):hover{background:rgba(79,70,229,0.08);color:#a5b4fc}
+.prog{height:4px;background:#1e293b;border-radius:99px;overflow:hidden}
+.prog-fill{height:100%;border-radius:99px;background:linear-gradient(90deg,#4f46e5,#7c3aed);transition:width .6s ease}
+.chat-bot{background:rgba(79,70,229,0.07);border:1px solid rgba(79,70,229,0.18);border-radius:14px 14px 14px 3px;padding:12px 16px;max-width:84%;font-size:13px;line-height:1.6;color:#cbd5e1}
+.chat-user{background:linear-gradient(135deg,#4f46e5,#7c3aed);border-radius:14px 14px 3px 14px;padding:12px 16px;max-width:84%;margin-left:auto;font-size:13px;color:#fff}
+.pill{padding:1px 7px;border-radius:6px;font-size:11px;font-weight:600;display:inline-block}
+.pg{background:rgba(5,150,105,0.12);color:#34d399}
+.pr{background:rgba(239,68,68,0.09);color:#f87171}
+.pb{background:rgba(59,130,246,0.1);color:#60a5fa}
+.spin{animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.fade{animation:fd .25s ease}
+@keyframes fd{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.blink{animation:bl 1.4s infinite}
+@keyframes bl{0%,100%{opacity:1}50%{opacity:.25}}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:#1e293b;border-radius:2px}
+@media(max-width:480px){.tab{padding:8px 10px;font-size:11px}}
+</style>
 </head>
-<body class="bg-darkbg text-gray-200 font-sans antialiased min-h-screen">
-    <div class="max-w-5xl mx-auto p-4 sm:p-6 lg:p-8">
-        <!-- Header -->
-        <header class="flex justify-between items-center bg-darkcard p-5 rounded-2xl shadow-lg mb-8 border border-gray-800">
-            <div class="flex items-center gap-4">
-                <div class="bg-gradient-to-br from-indigo-500 to-purple-600 text-white p-3 rounded-xl shadow-lg"><i class="fa-solid fa-map-location-dot text-2xl"></i></div>
-                <div>
-                    <h1 class="text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-purple-400">LeadGen Pro</h1>
-                    <span class="text-xs font-bold bg-green-500 text-white px-2 py-1 rounded-full">Python Library Engine (100% Free)</span>
-                </div>
-            </div>
-            <button onclick="switchTab('settings')" class="text-gray-400 hover:text-white transition bg-gray-800 p-3 rounded-xl border border-gray-700"><i class="fa-solid fa-gear text-xl"></i></button>
-        </header>
+<body>
 
-        <!-- Tabs -->
-        <div class="flex gap-4 mb-8">
-            <button onclick="switchTab('manual')" id="tab-manual" class="flex-1 py-4 font-bold rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow-lg transition transform hover:-translate-y-1">Manual Search</button>
-            <button onclick="switchTab('ai')" id="tab-ai" class="flex-1 py-4 font-bold rounded-xl bg-darkcard text-gray-400 shadow-md border border-gray-700 hover:bg-gray-800 transition transform hover:-translate-y-1">AI Agent Search</button>
-        </div>
+<!-- NAV -->
+<nav style="background:rgba(6,11,24,.96);border-bottom:1px solid rgba(99,102,241,0.1);backdrop-filter:blur(10px)"
+     class="sticky top-0 z-40 px-4 py-3 flex items-center justify-between">
+  <div class="flex items-center gap-3">
+    <div class="btn-p w-9 h-9 rounded-xl flex items-center justify-center text-sm"
+         style="box-shadow:0 0 18px rgba(79,70,229,0.45)">
+      <i class="fa-solid fa-location-dot"></i>
+    </div>
+    <div>
+      <div class="font-bold text-white text-sm leading-none">
+        LeadGen <span style="color:#818cf8">Pro</span>
+      </div>
+      <div class="flex items-center gap-1.5 mt-0.5">
+        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 blink"></span>
+        <span class="text-xs text-slate-500">Pure Python · Exact Target Guarantee Engine</span>
+      </div>
+    </div>
+  </div>
+  <div class="flex items-center gap-2">
+    <span class="pill pb text-xs" id="today-badge">
+      <i class="fa-solid fa-bolt mr-1 text-xs"></i><span id="tn">0</span> today
+    </span>
+    <button onclick="showTab('settings')"
+      class="w-9 h-9 rounded-xl flex items-center justify-center"
+      style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06)">
+      <i class="fa-solid fa-gear text-slate-400 text-sm"></i>
+    </button>
+  </div>
+</nav>
 
-        <!-- Manual Tab -->
-        <div id="content-manual" class="bg-darkcard p-8 rounded-2xl shadow-xl border border-gray-800">
-            <h2 class="text-2xl font-bold mb-6 text-white flex items-center gap-2"><i class="fa-solid fa-sliders text-indigo-400"></i> Manual Parameters</h2>
-            <div class="bg-blue-900/30 border border-blue-500/50 p-4 rounded-xl text-blue-400 mb-6 text-sm">
-                <i class="fa-solid fa-circle-info mr-2"></i> <b>Pro Tip:</b> For thousands of leads, search by specific cities (e.g., "Vancouver", "Toronto").
-            </div>
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
-                <div><label class="block text-sm font-medium mb-2 text-gray-400">Location (City Recommended) *</label><input id="m-loc" type="text" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., Vancouver"></div>
-                <div><label class="block text-sm font-medium mb-2 text-gray-400">Keyword *</label><input id="m-kw" type="text" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., Car Showroom"></div>
-                <div><label class="block text-sm font-medium mb-2 text-gray-400">Number of Leads</label><input id="m-count" type="number" value="100" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none"></div>
-                <div><label class="block text-sm font-medium mb-2 text-gray-400">Max Rating (Optional)</label><input id="m-rating" type="number" step="0.1" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., 4.5"></div>
-            </div>
-            <button onclick="startManual()" id="btn-manual" class="w-full bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 text-white font-bold py-4 rounded-xl shadow-lg transition text-lg"><i class="fa-solid fa-rocket mr-2"></i> Start Scraping</button>
-        </div>
+<div class="max-w-5xl mx-auto px-4 py-6">
 
-        <!-- AI Tab -->
-        <div id="content-ai" class="hidden bg-darkcard rounded-2xl shadow-xl border border-gray-800 flex flex-col h-[600px]">
-            <div class="bg-gradient-to-r from-indigo-600 to-purple-600 text-white p-5 rounded-t-2xl font-bold flex items-center gap-3 text-lg">
-                <i class="fa-solid fa-robot text-2xl"></i> Groq AI Lead Generation Agent
-            </div>
-            <div id="chat-box" class="flex-1 p-6 overflow-y-auto bg-[#0f172a] space-y-5">
-                <div class="flex gap-4">
-                    <div class="bg-darkcard border border-gray-700 text-gray-200 p-4 rounded-2xl rounded-tl-none max-w-[85%] shadow-md">
-                        Hello! I am your AI Agent powered by Groq. Tell me exactly what you need in plain English.<br><br>
-                        <span class="text-indigo-400 italic">Example: "I need 100 leads for car showrooms in Vancouver with maximum 3 star rating."</span>
-                    </div>
-                </div>
-            </div>
-            <div class="p-4 bg-darkcard border-t border-gray-800 flex gap-3 rounded-b-2xl">
-                <input id="ai-input" type="text" class="flex-1 bg-darkinput border border-gray-600 rounded-xl p-4 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="Type your request here..." onkeypress="if(event.key === 'Enter') sendAI()">
-                <button onclick="sendAI()" class="bg-gradient-to-r from-indigo-500 to-purple-600 text-white px-8 rounded-xl hover:shadow-lg transition"><i class="fa-solid fa-paper-plane text-xl"></i></button>
-            </div>
-        </div>
+  <!-- STATS -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-white" id="st">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-users text-indigo-400 text-xs"></i>Total Leads</div></div>
+    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-emerald-400" id="se">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-envelope text-emerald-400 text-xs"></i>Emails</div></div>
+    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-sky-400" id="sp">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-phone text-sky-400 text-xs"></i>Phones</div></div>
+    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-violet-400" id="sw">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-globe text-violet-400 text-xs"></i>Websites</div></div>
+  </div>
 
-        <!-- Settings Tab -->
-        <div id="content-settings" class="hidden bg-darkcard p-8 rounded-2xl shadow-xl border border-gray-800">
-            <h2 class="text-2xl font-bold mb-6 text-white flex items-center gap-2"><i class="fa-solid fa-key text-yellow-500"></i> API Settings</h2>
-            <div class="space-y-6">
-                <div class="bg-green-900/30 border border-green-500/50 p-4 rounded-xl text-green-400 mb-4">
-                    <i class="fa-solid fa-check-circle mr-2"></i> Using Custom Python Library Engine. 100% Free!
-                </div>
-                <div>
-                    <label class="block text-sm font-medium mb-2 text-gray-400">Groq API Key (For AI Brain)</label>
-                    <input id="groq-key" type="password" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="Enter Groq API Key">
-                    <p class="text-xs text-gray-400 mt-2">Get your free key from <a href="https://console.groq.com/keys" target="_blank" class="text-indigo-400 underline">console.groq.com</a></p>
-                </div>
-                <button onclick="saveSettings()" class="w-full bg-gradient-to-r from-blue-500 to-indigo-600 text-white font-bold py-3 rounded-xl shadow-lg hover:shadow-xl transition">Save Settings</button>
-            </div>
-        </div>
+  <!-- TABS -->
+  <div class="flex gap-2 mb-5 overflow-x-auto pb-1">
+    <button class="tab on" id="tab-manual" onclick="showTab('manual')"><i class="fa-solid fa-sliders mr-1.5"></i>Manual</button>
+    <button class="tab" id="tab-ai" onclick="showTab('ai')"><i class="fa-solid fa-robot mr-1.5"></i>AI Agent</button>
+    <button class="tab" id="tab-history" onclick="showTab('history')"><i class="fa-solid fa-clock-rotate-left mr-1.5"></i>History</button>
+    <button class="tab" id="tab-settings" onclick="showTab('settings')"><i class="fa-solid fa-gear mr-1.5"></i>Settings</button>
+  </div>
 
-        <!-- Status Area -->
-        <div id="status-area" class="hidden mt-8 p-6 rounded-2xl border bg-darkcard border-gray-700 shadow-xl">
-            <div class="flex items-center gap-4 mb-4">
-                <i id="status-icon" class="fa-solid fa-circle-notch fa-spin text-indigo-500 text-3xl"></i>
-                <span id="status-text" class="text-xl font-semibold text-white">Processing...</span>
-            </div>
-            <button id="dl-btn" class="hidden w-full mt-4 bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 text-white font-bold py-4 rounded-xl shadow-lg transition text-lg"><i class="fa-solid fa-download mr-2"></i> Download CSV</button>
+  <!-- MANUAL PANE -->
+  <div id="pane-manual" class="fade">
+    <div class="card p-6 mb-4">
+      <h2 class="font-bold text-white text-sm mb-5 flex items-center gap-2">
+        <span class="btn-p w-7 h-7 rounded-lg flex items-center justify-center text-xs"><i class="fa-solid fa-crosshairs"></i></span>
+        Search Parameters
+      </h2>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-5">
+        <div>
+          <label class="text-xs text-slate-500 mb-1.5 block">📍 Location *</label>
+          <input id="m-loc" class="inp" placeholder="e.g. Vancouver, Canada">
         </div>
+        <div>
+          <label class="text-xs text-slate-500 mb-1.5 block">🔍 Keyword *</label>
+          <input id="m-kw" class="inp" placeholder="e.g. car showroom">
+        </div>
+        <div>
+          <label class="text-xs text-slate-500 mb-1.5 block">🔢 Exact Number of Leads</label>
+          <input id="m-count" type="number" value="50" class="inp">
+        </div>
+        <div>
+          <label class="text-xs text-slate-500 mb-1.5 block">⭐ Max Rating (Optional)</label>
+          <input id="m-rating" type="number" step="0.1" class="inp" placeholder="e.g. 4.0">
+        </div>
+      </div>
+      <button onclick="startManual()" id="btn-run" class="btn-p w-full py-3 rounded-xl text-sm">
+        <i class="fa-solid fa-rocket mr-2"></i>Start Scraping
+      </button>
     </div>
 
-    <script>
-        let currentJob = null;
-        let aiState = {};
+    <!-- STATUS -->
+    <div id="sbox" class="hidden card p-5 mb-4 fade">
+      <div class="flex items-center gap-3 mb-3">
+        <i id="si" class="fa-solid fa-circle-notch spin text-indigo-400 text-xl"></i>
+        <span id="stxt" class="font-semibold text-white text-sm">Processing...</span>
+      </div>
+      <div class="prog mb-2"><div class="prog-fill" id="sbar" style="width:0%"></div></div>
+      <div id="sdet" class="text-xs text-slate-500 mb-3"></div>
+      <button id="dlbtn" onclick="doDL()" class="hidden btn-g w-full py-3 rounded-xl text-sm">
+        <i class="fa-solid fa-download mr-2"></i>Download CSV
+      </button>
+    </div>
 
-        function switchTab(tab) {
-            ['manual', 'ai', 'settings'].forEach(t => {
-                document.getElementById('content-'+t).classList.add('hidden');
-                let btn = document.getElementById('tab-'+t);
-                if(btn) btn.className = 'flex-1 py-4 font-bold rounded-xl bg-darkcard text-gray-400 shadow-md border border-gray-700 hover:bg-gray-800 transition transform hover:-translate-y-1';
-            });
-            document.getElementById('content-'+tab).classList.remove('hidden');
-            let activeBtn = document.getElementById('tab-'+tab);
-            if(activeBtn) activeBtn.className = 'flex-1 py-4 font-bold rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow-lg transition transform hover:-translate-y-1';
-        }
+    <!-- PREVIEW TABLE -->
+    <div id="pvbox" class="hidden card p-5 fade">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="font-bold text-white text-sm flex items-center gap-2">
+          <i class="fa-solid fa-table-cells text-indigo-400 text-xs"></i>
+          Preview <span id="pvcnt" class="text-slate-500 font-normal text-xs"></span>
+        </h3>
+        <button onclick="doDL()" class="btn-g px-4 py-2 rounded-lg text-xs">
+          <i class="fa-solid fa-download mr-1"></i>CSV
+        </button>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-xs border-collapse">
+          <thead><tr id="th" class="text-slate-500"></tr></thead>
+          <tbody id="tb"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
 
-        function saveSettings() {
-            const groq = document.getElementById('groq-key').value;
-            fetch('/api/settings', { 
-                method: 'POST', 
-                headers: {'Content-Type':'application/json'}, 
-                body: JSON.stringify({groq: groq}) 
-            }).then(() => alert('Settings Saved Successfully!'));
-        }
+  <!-- AI PANE -->
+  <div id="pane-ai" class="hidden fade">
+    <div class="card overflow-hidden flex flex-col" style="height:550px">
+      <div class="px-5 py-4 flex items-center gap-3"
+           style="background:rgba(79,70,229,0.07);border-bottom:1px solid rgba(79,70,229,0.13)">
+        <div class="btn-p w-9 h-9 rounded-xl flex items-center justify-center text-xs">
+          <i class="fa-solid fa-robot"></i>
+        </div>
+        <div>
+          <div class="font-bold text-white text-sm">AI Lead Agent</div>
+          <div class="text-xs text-emerald-400 flex items-center gap-1">
+            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 blink"></span>Groq Powered
+          </div>
+        </div>
+      </div>
+      <div id="cbox" class="flex-1 overflow-y-auto p-5 space-y-3" style="background:rgba(0,0,0,0.25)">
+        <div class="chat-bot fade">
+          👋 Hi! Tell me what leads you need.<br><br>
+          <span style="color:#818cf8;font-style:italic">"Find 100 car showrooms in Vancouver, max rating 3.5"</span>
+        </div>
+      </div>
+      <div class="p-4 flex gap-2" style="border-top:1px solid rgba(79,70,229,0.1)">
+        <input id="ai-inp" class="inp flex-1" placeholder="Type your request..."
+               onkeypress="if(event.key==='Enter')sendAI()">
+        <button onclick="sendAI()" class="btn-p w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0 text-sm">
+          <i class="fa-solid fa-paper-plane"></i>
+        </button>
+      </div>
+    </div>
+  </div>
 
-        function showStatus(msg, isSpin=true, isError=false) {
-            const area = document.getElementById('status-area');
-            area.classList.remove('hidden');
-            document.getElementById('status-text').innerText = msg;
-            
-            const icon = document.getElementById('status-icon');
-            if(isSpin) {
-                icon.className = 'fa-solid fa-circle-notch fa-spin text-indigo-500 text-3xl';
-            } else if(isError) {
-                icon.className = 'fa-solid fa-circle-xmark text-red-500 text-3xl';
-            } else {
-                icon.className = 'fa-solid fa-circle-check text-green-500 text-3xl';
-            }
-            document.getElementById('dl-btn').classList.add('hidden');
-        }
+  <!-- HISTORY PANE -->
+  <div id="pane-history" class="hidden fade">
+    <div class="card p-6">
+      <div class="flex items-center justify-between mb-5">
+        <h2 class="font-bold text-white text-sm flex items-center gap-2">
+          <i class="fa-solid fa-clock-rotate-left text-violet-400 text-xs"></i>History
+        </h2>
+        <button onclick="clearH()" class="text-xs text-slate-600 hover:text-red-400 transition">
+          <i class="fa-solid fa-trash mr-1"></i>Clear
+        </button>
+      </div>
+      <div id="hlist" class="space-y-2">
+        <div class="text-xs text-slate-600 text-center py-8">No history yet</div>
+      </div>
+    </div>
+  </div>
 
-        async function startJob(payload) {
-            showStatus('Running Python Library Engine (Extracting Data & Emails)...');
-            const res = await fetch('/api/scrape', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-            const data = await res.json();
-            if(data.error) return showStatus(data.error, false, true);
-            
-            currentJob = data.job_id;
-            checkStatus();
-        }
+  <!-- SETTINGS PANE -->
+  <div id="pane-settings" class="hidden fade">
+    <div class="card p-6 space-y-5">
+      <h2 class="font-bold text-white text-sm flex items-center gap-2">
+        <i class="fa-solid fa-gear text-slate-400 text-xs"></i>Settings
+      </h2>
+      <div class="p-4 rounded-xl text-xs"
+           style="background:rgba(5,150,105,0.07);border:1px solid rgba(5,150,105,0.2);color:#34d399">
+        <i class="fa-solid fa-check-circle mr-2"></i>Pure Python engine — no API key needed for scraping
+      </div>
+      <div>
+        <label class="text-xs text-slate-500 mb-1.5 block">Groq API Key (AI Agent এর জন্য)</label>
+        <input id="gk" type="password" class="inp" placeholder="gsk_...">
+        <p class="text-xs text-slate-600 mt-1.5">
+          Free: <a href="https://console.groq.com/keys" target="_blank" style="color:#818cf8">console.groq.com</a>
+        </p>
+      </div>
+      <button onclick="saveS()" class="btn-p w-full py-3 rounded-xl text-sm">
+        <i class="fa-solid fa-floppy-disk mr-2"></i>Save
+      </button>
+      <div id="sok" class="hidden text-center text-xs text-emerald-400">✅ Saved!</div>
+    </div>
+  </div>
 
-        function startManual() {
-            const loc = document.getElementById('m-loc').value;
-            const kw = document.getElementById('m-kw').value;
-            if(!loc || !kw) return alert("Location and Keyword are required!");
-            
-            startJob({
-                location: loc, keyword: kw,
-                max_leads: document.getElementById('m-count').value || 100,
-                max_rating: document.getElementById('m-rating').value || null
-            });
-        }
+</div>
 
-        async function checkStatus() {
-            const res = await fetch('/api/status/' + currentJob);
-            const data = await res.json();
-            if(data.status === 'done') {
-                if(data.count === 0) {
-                    showStatus(`0 leads found. Try a specific city name instead of a country.`, false, true);
-                } else {
-                    showStatus(`Success! Found ${data.count} high-quality leads.`, false, false);
-                    const btn = document.getElementById('dl-btn');
-                    btn.classList.remove('hidden');
-                    btn.onclick = () => window.location = '/api/download/' + currentJob;
-                }
-            } else if(data.status === 'error') {
-                showStatus('Error: ' + data.error, false, true);
-            } else {
-                setTimeout(checkStatus, 5000);
-            }
-        }
+<script>
+let jid=null, aiSt={}, hist=[], today=0;
 
-        function addMsg(text, isBot=false, isHtml=false) {
-            const box = document.getElementById('chat-box');
-            const div = document.createElement('div');
-            div.className = `flex gap-4 ${isBot ? '' : 'justify-end'}`;
-            
-            let contentClass = isBot 
-                ? 'bg-darkcard border border-gray-700 text-gray-200 p-4 rounded-2xl rounded-tl-none shadow-md' 
-                : 'bg-gradient-to-r from-indigo-500 to-purple-600 text-white p-4 rounded-2xl rounded-tr-none shadow-md';
-            
-            div.innerHTML = `<div class="${contentClass} max-w-[85%]">${isHtml ? text : text.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</div>`;
-            box.appendChild(div);
-            box.scrollTop = box.scrollHeight;
-        }
+window.onload=()=>{
+  const k=localStorage.getItem('gk'); if(k) document.getElementById('gk').value=k;
+  hist=JSON.parse(localStorage.getItem('lh')||'[]'); renderH();
+};
 
-        async function sendAI() {
-            const inp = document.getElementById('ai-input');
-            const text = inp.value.trim();
-            if(!text) return;
-            addMsg(text, false);
-            inp.value = '';
+function showTab(t){
+  ['manual','ai','history','settings'].forEach(x=>{
+    document.getElementById('pane-'+x).classList.add('hidden');
+    const b=document.getElementById('tab-'+x); if(b) b.classList.remove('on');
+  });
+  document.getElementById('pane-'+t).classList.remove('hidden');
+  const ab=document.getElementById('tab-'+t); if(ab) ab.classList.add('on');
+}
 
-            const box = document.getElementById('chat-box');
-            const loadDiv = document.createElement('div');
-            loadDiv.id = 'typing-indicator';
-            loadDiv.className = 'flex gap-4';
-            loadDiv.innerHTML = `<div class="bg-darkcard border border-gray-700 text-gray-400 p-4 rounded-2xl rounded-tl-none shadow-md"><i class="fa-solid fa-ellipsis fa-fade text-xl"></i></div>`;
-            box.appendChild(loadDiv);
-            box.scrollTop = box.scrollHeight;
+function saveS(){
+  const k=document.getElementById('gk').value.trim();
+  if(!k){alert('Key দাও!');return;}
+  localStorage.setItem('gk',k);
+  fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({groq:k})});
+  const el=document.getElementById('sok'); el.classList.remove('hidden'); setTimeout(()=>el.classList.add('hidden'),2000);
+}
 
-            try {
-                const res = await fetch('/api/chat', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({text: text, state: aiState})
-                });
-                const data = await res.json();
-                
-                document.getElementById('typing-indicator').remove();
+function setSt(msg,state='load',pct=null){
+  document.getElementById('sbox').classList.remove('hidden');
+  document.getElementById('stxt').textContent=msg;
+  const ic=document.getElementById('si');
+  ic.className=state==='load'?'fa-solid fa-circle-notch spin text-indigo-400 text-xl':
+               state==='done'?'fa-solid fa-circle-check text-emerald-400 text-xl':
+               'fa-solid fa-circle-xmark text-red-400 text-xl';
+  if(pct!=null) document.getElementById('sbar').style.width=pct+'%';
+}
 
-                if(data.error) {
-                    addMsg(data.error, true);
-                    return;
-                }
+function updStats(leads, eCount, pCount, wCount){
+  document.getElementById('st').textContent=leads.length;
+  document.getElementById('se').textContent=eCount;
+  document.getElementById('sp').textContent=pCount;
+  document.getElementById('sw').textContent=wCount;
+  today+=leads.length; document.getElementById('tn').textContent=today;
+}
 
-                if(data.ready) {
-                    aiState = data.state;
-                    let summary = `Got it! Here is what I understood:<br><br>
-                    📍 <b>Location:</b> ${aiState.loc}<br>
-                    🔍 <b>Keyword:</b> ${aiState.kw}<br>
-                    🔢 <b>Leads:</b> ${aiState.count}<br>`;
-                    if(aiState.rating) summary += `⭐ <b>Max Rating:</b> ${aiState.rating}<br>`;
-                    
-                    summary += `<br><button onclick='startJob(${JSON.stringify({location: aiState.loc, keyword: aiState.kw, max_leads: aiState.count, max_rating: aiState.rating})})' class='mt-3 bg-gradient-to-r from-green-500 to-emerald-600 text-white px-6 py-2 rounded-lg font-bold shadow hover:shadow-lg transition'>🚀 Start Library Engine</button>`;
-                    
-                    addMsg(summary, true, true);
-                } else {
-                    addMsg(data.reply, true);
-                }
-            } catch (err) {
-                document.getElementById('typing-indicator').remove();
-                addMsg("Error communicating with server.", true);
-            }
-        }
-    </script>
+async function startJob(payload){
+  setSt('Scraping শুরু হয়েছে (Target পূরণ না হওয়া পর্যন্ত খুঁজবে)...','load',6);
+  document.getElementById('dlbtn').classList.add('hidden');
+  document.getElementById('pvbox').classList.add('hidden');
+  document.getElementById('sdet').textContent='';
+  const btn=document.getElementById('btn-run'); if(btn) btn.disabled=true;
+
+  const r=await fetch('/api/scrape',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const d=await r.json();
+  if(d.error){setSt(d.error,'err');if(btn)btn.disabled=false;return;}
+  jid=d.job_id;
+
+  let pct=6;
+  const iv=setInterval(()=>{pct=Math.min(pct+3,87);document.getElementById('sbar').style.width=pct+'%';},8000);
+
+  const poll=async()=>{
+    const r2=await fetch('/api/status/'+jid); const d2=await r2.json();
+    if(d2.status==='done'){
+      clearInterval(iv); if(btn) btn.disabled=false;
+      setSt(`✅ সম্পন্ন — ${d2.count} leads found`,'done',100);
+      document.getElementById('sdet').textContent=`📧 ${d2.emails} email · 📞 ${d2.phones} phone · 🌐 ${d2.websites} website`;
+      document.getElementById('dlbtn').classList.remove('hidden');
+      updStats(d2.leads||[], d2.emails, d2.phones, d2.websites);
+      showPV(d2.leads||[]);
+      addH(payload.location,payload.keyword,d2.count);
+    } else if(d2.status==='error'){
+      clearInterval(iv); if(btn) btn.disabled=false;
+      setSt('Error: '+d2.error,'err');
+    } else { setTimeout(poll,6000); }
+  };
+  setTimeout(poll,4000);
+}
+
+function startManual(){
+  const loc=document.getElementById('m-loc').value.trim();
+  const kw=document.getElementById('m-kw').value.trim();
+  if(!loc||!kw){alert('Location আর Keyword দাও!');return;}
+  startJob({
+      location: loc, 
+      keyword: kw, 
+      max_leads: parseInt(document.getElementById('m-count').value)||50,
+      max_rating: document.getElementById('m-rating').value || null
+  });
+}
+
+function doDL(){ if(jid) window.location='/api/download/'+jid; }
+
+function showPV(leads){
+  if(!leads.length) return;
+  document.getElementById('pvbox').classList.remove('hidden');
+  document.getElementById('pvcnt').textContent='('+leads.length+' total, top 10)';
+  const keys=Object.keys(leads[0]);
+  document.getElementById('th').innerHTML=keys.map(k=>`<th class="px-3 py-2 text-left text-slate-500 font-medium whitespace-nowrap" style="border-bottom:1px solid rgba(255,255,255,0.05)">${k}</th>`).join('');
+  document.getElementById('tb').innerHTML=leads.slice(0,10).map(l=>
+    `<tr style="border-bottom:1px solid rgba(255,255,255,0.04)">${keys.map(k=>{
+      const v=(l[k]||'N/A').toString();
+      const cls=v==='N/A'?'pr':k==='Email'?'pg':k==='Phone'?'pb':'';
+      return `<td class="px-3 py-2.5 text-slate-300 max-w-xs whitespace-nowrap overflow-hidden text-ellipsis">${cls?`<span class="pill ${cls}">${v}</span>`:v}</td>`;
+    }).join('')}</tr>`
+  ).join('');
+}
+
+function addH(loc,kw,count){ hist.unshift({loc,kw,count,t:new Date().toLocaleTimeString()}); hist=hist.slice(0,20); localStorage.setItem('lh',JSON.stringify(hist)); renderH(); }
+function clearH(){ hist=[]; localStorage.removeItem('lh'); renderH(); }
+function renderH(){
+  const el=document.getElementById('hlist');
+  if(!hist.length){el.innerHTML='<div class="text-xs text-slate-600 text-center py-8">No history yet</div>';return;}
+  el.innerHTML=hist.map((h,i)=>`
+    <div class="p-4 rounded-xl flex items-center justify-between fade" style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.05)">
+      <div>
+        <div class="text-sm font-semibold text-white">📍 ${h.loc} · 🔍 ${h.kw}</div>
+        <div class="text-xs text-slate-500 mt-1">📊 ${h.count} leads · ${h.t}</div>
+      </div>
+      <button onclick="rerun(${i})" class="btn-p px-3 py-1.5 rounded-lg text-xs"><i class="fa-solid fa-redo mr-1"></i>Re-run</button>
+    </div>`).join('');
+}
+function rerun(i){ const h=hist[i]; document.getElementById('m-loc').value=h.loc; document.getElementById('m-kw').value=h.kw; showTab('manual'); startJob({location:h.loc,keyword:h.kw,max_leads:h.count}); }
+
+// AI
+function addM(html,isU=false){ const box=document.getElementById('cbox'); const d=document.createElement('div'); d.className=(isU?'chat-user':'chat-bot')+' fade'; d.innerHTML=html; box.appendChild(d); box.scrollTop=99999; return d; }
+
+async function sendAI(){
+  const inp=document.getElementById('ai-inp'); const text=inp.value.trim(); if(!text) return;
+  const key=localStorage.getItem('gk');
+  addM(text.replace(/</g,'&lt;'),true); inp.value='';
+  const ld=addM('<i class="fa-solid fa-ellipsis blink"></i>');
+  const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,state:aiSt})});
+  const d=await r.json(); ld.remove();
+  if(d.error){addM('❌ '+d.error);return;}
+  if(d.ready){
+    aiSt=d.state;
+    let stHTML = `Got it! 🎯<br><br>📍 <b>${d.state.loc}</b> · 🔍 <b>${d.state.kw}</b> · 🔢 <b>${d.state.count} leads</b>`;
+    if(d.state.rating) stHTML += ` · ⭐ Max ${d.state.rating}`;
+    
+    addM(`${stHTML}<br><br>
+      <button onclick="startJob({location:'${d.state.loc}',keyword:'${d.state.kw}',max_leads:${d.state.count},max_rating:'${d.state.rating||''}'});showTab('manual')"
+        style="margin-top:10px;padding:8px 18px;border-radius:9px;font-size:12px;font-weight:700;cursor:pointer;background:linear-gradient(135deg,#059669,#0d9488);color:white">
+        🚀 Start Engine</button>`);
+  } else { addM(d.reply); }
+}
+</script>
 </body>
-</html>
-"""
+</html>"""
 
 @flask_app.route('/')
 def index():
@@ -501,10 +629,17 @@ def run_scrape_thread(job_id, data):
         leads = run_full_scraper(
             data.get('location'), 
             data.get('keyword'),
-            data.get('max_leads', 100),
+            data.get('max_leads', 50),
             data.get('max_rating')
         )
-        jobs[job_id] = {'status': 'done', 'leads': leads, 'count': len(leads)}
+        jobs[job_id] = {
+            'status': 'done', 
+            'leads': leads, 
+            'count': len(leads),
+            'emails': sum(1 for l in leads if l.get('Email', 'N/A') != 'N/A'),
+            'phones': sum(1 for l in leads if l.get('Phone', 'N/A') != 'N/A'),
+            'websites': sum(1 for l in leads if l.get('Website', 'N/A') != 'N/A')
+        }
     except Exception as e:
         jobs[job_id] = {'status': 'error', 'error': str(e)}
 
@@ -520,7 +655,10 @@ def start_api_job():
 @flask_app.route('/api/status/<job_id>')
 def status(job_id):
     job = jobs.get(job_id, {'status': 'not_found'})
-    return jsonify({'status': job['status'], 'count': job.get('count', 0), 'error': job.get('error')})
+    out = dict(job)
+    if out.get('status') == 'done':
+        out['leads'] = job.get('leads', [])[:10] # send only top 10 for preview
+    return jsonify(out)
 
 @flask_app.route('/api/download/<job_id>')
 def download(job_id):
@@ -534,7 +672,7 @@ def download(job_id):
     writer.writeheader()
     writer.writerows(leads)
     out.seek(0)
-    return send_file(io.BytesIO(out.getvalue().encode('utf-8-sig')), mimetype='text/csv', as_attachment=True, download_name='library_leads.csv')
+    return send_file(io.BytesIO(out.getvalue().encode('utf-8-sig')), mimetype='text/csv', as_attachment=True, download_name='Target_Leads.csv')
 
 # ══════════════════════════════════════════════
 #   TELEGRAM BOT
@@ -556,7 +694,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🛠️ Manual Search", callback_data="mode_manual")],
         [InlineKeyboardButton("🤖 Groq AI Search", callback_data="mode_ai")]
     ]
-    await update.message.reply_text("👋 *Pro Lead Gen Bot (Python Library Engine)*\n\nকীভাবে সার্চ করতে চাও?", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("👋 *Pro Lead Gen Bot (Target Guarantee Engine)*\n\nকীভাবে সার্চ করতে চাও?", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
 
 async def handle_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -606,7 +744,7 @@ async def ai_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bot_store[uid] = {
             'loc': parsed['loc'],
             'kw': parsed['kw'],
-            'count': parsed.get('count', 100),
+            'count': parsed.get('count', 50),
             'rating': parsed.get('rating')
         }
         await msg.delete()
@@ -617,7 +755,7 @@ async def ai_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def ask_confirm(update, uid):
     data = bot_store[uid]
-    txt = f"📋 *Summary (Library Engine)*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Leads: {data['count']}\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nশুরু করবো?"
+    txt = f"📋 *Target Guarantee Engine*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Exact Target: {data['count']}\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nশুরু করবো?"
     kb = [[InlineKeyboardButton("✅ Start Automation", callback_data="start_scrape")]]
     await update.message.reply_text(txt, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
@@ -628,23 +766,24 @@ async def execute_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     data = bot_store.get(uid)
     
-    msg = await q.edit_message_text("⏳ *Scraping & Deep Email Extraction চলছে...*\n_একটু সময় লাগতে পারে_", parse_mode='Markdown')
+    msg = await q.edit_message_text("⏳ *Scraping & Deep Email Extraction চলছে...*\n_টার্গেট পূরণ না হওয়া পর্যন্ত খুঁজতে থাকবে_", parse_mode='Markdown')
     
     try:
         loop = asyncio.get_event_loop()
         leads = await loop.run_in_executor(None, run_full_scraper, data['loc'], data['kw'], data['count'], data.get('rating'))
         
         if not leads:
-            return await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text="😔 কোনো result নেই। দয়া করে দেশের নামের বদলে নির্দিষ্ট শহরের নাম (যেমন: Vancouver) দিয়ে সার্চ করো।")
+            return await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text="😔 কোনো result নেই। দয়া করে দেশের নামের বদলে নির্দিষ্ট শহরের নাম দিয়ে সার্চ করো।")
 
         path = to_csv(leads)
         em = sum(1 for l in leads if str(l.get('Email','')) not in ('N/A','','None'))
+        ph = sum(1 for l in leads if str(l.get('Phone','')) not in ('N/A','','None'))
         
         await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text="✅ হয়ে গেছে! ফাইল পাঠাচ্ছি...")
         with open(path, 'rb') as f:
             await ctx.bot.send_document(
-                chat_id=q.message.chat_id, document=f, filename=f"library_leads.csv",
-                caption=f"🎯 *Done!*\n📊 Total: {len(leads)} | 📧 Emails Found: {em}", parse_mode='Markdown'
+                chat_id=q.message.chat_id, document=f, filename=f"Target_Leads.csv",
+                caption=f"🎯 *Target Reached!*\n📊 Total Leads: {len(leads)} | 📧 Emails: {em} | 📞 Phones: {ph}", parse_mode='Markdown'
             )
         os.unlink(path)
     except Exception as e:
