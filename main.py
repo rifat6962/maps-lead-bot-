@@ -110,8 +110,8 @@ class DeepEmailExtractor:
 #   3. AI KEYWORD GENERATOR & PERSONALIZER
 # ══════════════════════════════════════════════
 def generate_ai_keywords(base_kw, location, used_kws):
-    if not GROQ_API_KEY: 
-        return [f"best {base_kw}", f"top {base_kw}", f"{base_kw} services", f"affordable {base_kw}"]
+    fallback = [f"best {base_kw}", f"top {base_kw}", f"{base_kw} services", f"affordable {base_kw}", f"{base_kw} agency", f"{base_kw} near me"]
+    if not GROQ_API_KEY: return fallback
     try:
         client = Groq(api_key=GROQ_API_KEY)
         prompt = f"I am searching for '{base_kw}' in '{location}'. Used keywords: {list(used_kws)}. Generate 10 NEW, highly related search terms/categories. Return ONLY a comma-separated list."
@@ -122,9 +122,9 @@ def generate_ai_keywords(base_kw, location, used_kws):
         )
         text = res.choices[0].message.content
         new_kws = [k.strip() for k in text.split(',') if k.strip() and k.strip().lower() not in used_kws]
-        return new_kws if new_kws else [f"best {base_kw}", f"{base_kw} near me"]
+        return new_kws if new_kws else fallback
     except:
-        return [f"best {base_kw}", f"{base_kw} agency", f"top {base_kw}"]
+        return fallback
 
 def personalize_email(lead_name, niche, template_subject, template_body):
     if not GROQ_API_KEY: return template_subject, template_body
@@ -138,7 +138,7 @@ def personalize_email(lead_name, niche, template_subject, template_body):
         Original Body: {template_body}
         
         Return ONLY a valid JSON object with keys "subject" and "body".
-        Ensure the body uses HTML formatting (<br>, <b>, etc.). Do not include markdown blocks like ```json.
+        Ensure the body uses HTML formatting (<br>, <b>, etc.). Do not include markdown blocks.
         """
         res = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
@@ -152,7 +152,6 @@ def personalize_email(lead_name, niche, template_subject, template_body):
             return data.get("subject", template_subject), data.get("body", template_body)
         return template_subject, template_body
     except Exception as e:
-        print(f"Personalization Error: {e}")
         return template_subject, template_body
 
 # ══════════════════════════════════════════════
@@ -162,7 +161,7 @@ def run_job_thread(job_id, data):
     try:
         location = data.get('location')
         base_keyword = data.get('keyword')
-        max_leads = min(int(data.get('max_leads', 10)), 200) # Max limit 200
+        max_leads = min(int(data.get('max_leads', 10)), 200) # Max limit 200 enforced
         max_rating = data.get('max_rating')
         webhook_url = data.get('webhook_url')
         templates = data.get('templates', [])
@@ -177,7 +176,7 @@ def run_job_thread(job_id, data):
         
         jobs[job_id] = {'status': 'scraping', 'count': 0, 'status_text': 'Starting engine...'}
         
-        # --- PHASE 1: SCRAPING ---
+        # --- PHASE 1: SCRAPING (Target Guarantee) ---
         while len(final_leads) < max_leads:
             if not pending_keywords:
                 jobs[job_id]['status_text'] = f"Generating new keywords for '{base_keyword}'..."
@@ -211,13 +210,14 @@ def run_job_thread(job_id, data):
                     
                     if lead['Website'] == 'N/A': continue
                     email = email_lib.get_email(lead['Website'])
-                    if email == "N/A": continue
+                    if email == "N/A": continue # Strict Valid Email check
                     
                     lead['Email'] = email
                     seen_names.add(lead['Name'])
                     final_leads.append(lead)
                     
                     jobs[job_id]['count'] = len(final_leads)
+                    jobs[job_id]['leads'] = final_leads # Save for UI preview
                     jobs[job_id]['status_text'] = f"Found {len(final_leads)}/{max_leads} valid emails... (Searching: {current_kw})"
                         
                 start += 20
@@ -229,23 +229,16 @@ def run_job_thread(job_id, data):
         # --- PHASE 2: AUTOMATED EMAIL SENDING ---
         if webhook_url and templates and len(final_leads) > 0:
             jobs[job_id]['status'] = 'sending_emails'
+            jobs[job_id]['total_to_send'] = len(final_leads)
             emails_sent = 0
             
             for lead in final_leads:
                 jobs[job_id]['status_text'] = f"Sending personalized email {emails_sent+1}/{len(final_leads)} to {lead['Email']}..."
                 
-                # Pick random template
                 template = random.choice(templates)
-                
-                # Personalize via AI
                 p_subject, p_body = personalize_email(lead['Name'], base_keyword, template['subject'], template['body'])
                 
-                # Send via Google Apps Script
-                payload = {
-                    "to": lead['Email'],
-                    "subject": p_subject,
-                    "body": p_body
-                }
+                payload = {"to": lead['Email'], "subject": p_subject, "body": p_body}
                 try:
                     requests.post(webhook_url, json=payload, timeout=10)
                     emails_sent += 1
@@ -257,7 +250,7 @@ def run_job_thread(job_id, data):
                 if emails_sent < len(final_leads):
                     delay = random.randint(60, 120)
                     for i in range(delay, 0, -1):
-                        jobs[job_id]['status_text'] = f"Waiting {i}s to prevent spam before next email..."
+                        jobs[job_id]['status_text'] = f"Anti-Spam: Waiting {i}s before next email..."
                         time.sleep(1)
         
         # --- FINISHED ---
@@ -284,6 +277,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 *{box-sizing:border-box}
 body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;min-height:100vh}
 .card{background:rgba(15,23,42,0.85);border:1px solid rgba(99,102,241,0.12);border-radius:16px}
+.card-hover{transition:all .2s}
+.card-hover:hover{border-color:rgba(99,102,241,0.35);transform:translateY(-2px)}
 .btn-p{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;font-weight:600;cursor:pointer;transition:all .2s;border:none}
 .btn-p:hover{filter:brightness(1.12);transform:translateY(-1px);box-shadow:0 6px 20px rgba(79,70,229,0.4)}
 .btn-p:disabled{opacity:.45;cursor:not-allowed;transform:none;filter:none}
@@ -323,6 +318,14 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
 
 <div class="max-w-5xl mx-auto px-4 py-6">
 
+  <!-- STATS -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-white" id="st">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-users text-indigo-400 text-xs"></i>Total Leads</div></div>
+    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-emerald-400" id="se">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-envelope text-emerald-400 text-xs"></i>Emails</div></div>
+    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-sky-400" id="sp">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-phone text-sky-400 text-xs"></i>Phones</div></div>
+    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-violet-400" id="sw">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-globe text-violet-400 text-xs"></i>Websites</div></div>
+  </div>
+
   <!-- TABS -->
   <div class="flex gap-2 mb-5 overflow-x-auto pb-1">
     <button class="tab on" id="tab-search" onclick="showTab('search')"><i class="fa-solid fa-search mr-1.5"></i>Search & Run</button>
@@ -359,6 +362,25 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
       <div class="prog mb-2"><div class="prog-fill" id="sbar" style="width:0%"></div></div>
       <div id="sdet" class="text-xs text-slate-400 mb-3 font-mono bg-slate-900 p-2 rounded"></div>
       <button id="dlbtn" onclick="doDL()" class="hidden btn-g w-full py-3 rounded-xl text-sm"><i class="fa-solid fa-download mr-2"></i>Download Leads CSV</button>
+    </div>
+
+    <!-- PREVIEW TABLE -->
+    <div id="pvbox" class="hidden card p-5 fade">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="font-bold text-white text-sm flex items-center gap-2">
+          <i class="fa-solid fa-table-cells text-indigo-400 text-xs"></i>
+          Preview <span id="pvcnt" class="text-slate-500 font-normal text-xs"></span>
+        </h3>
+        <button onclick="doDL()" class="btn-g px-4 py-2 rounded-lg text-xs">
+          <i class="fa-solid fa-download mr-1"></i>CSV
+        </button>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-xs border-collapse">
+          <thead><tr id="th" class="text-slate-500"></tr></thead>
+          <tbody id="tb"></tbody>
+        </table>
+      </div>
     </div>
   </div>
 
@@ -420,7 +442,7 @@ function doPost(e) {
 </div>
 
 <script>
-let jid=null, templates=[], historyData=[];
+let jid=null, templates=[], historyData=[], tableShown=false;
 
 window.onload=()=>{
   document.getElementById('webhook-url').value = localStorage.getItem('webhook_url') || '';
@@ -494,6 +516,28 @@ function setSt(msg, state='load', pct=null){
   if(pct!=null) document.getElementById('sbar').style.width=pct+'%';
 }
 
+function updStats(leads){
+  document.getElementById('st').textContent=leads.length;
+  document.getElementById('se').textContent=leads.length; // all have emails
+  document.getElementById('sp').textContent=leads.filter(l=>l.Phone&&l.Phone!='N/A').length;
+  document.getElementById('sw').textContent=leads.length;
+}
+
+function showPV(leads){
+  if(!leads || !leads.length) return;
+  document.getElementById('pvbox').classList.remove('hidden');
+  document.getElementById('pvcnt').textContent='('+leads.length+' total, top 10)';
+  const keys=Object.keys(leads[0]);
+  document.getElementById('th').innerHTML=keys.map(k=>`<th class="px-3 py-2 text-left text-slate-500 font-medium whitespace-nowrap" style="border-bottom:1px solid rgba(255,255,255,0.05)">${k}</th>`).join('');
+  document.getElementById('tb').innerHTML=leads.slice(0,10).map(l=>
+    `<tr style="border-bottom:1px solid rgba(255,255,255,0.04)">${keys.map(k=>{
+      const v=(l[k]||'N/A').toString();
+      const cls=v==='N/A'?'pr':k==='Email'?'pg':k==='Phone'?'pb':'';
+      return `<td class="px-3 py-2.5 text-slate-300 max-w-xs whitespace-nowrap overflow-hidden text-ellipsis">${cls?`<span class="pill ${cls}">${v}</span>`:v}</td>`;
+    }).join('')}</tr>`
+  ).join('');
+}
+
 async function startJob(){
   const loc=document.getElementById('m-loc').value.trim();
   const kw=document.getElementById('m-kw').value.trim();
@@ -508,7 +552,9 @@ async function startJob(){
 
   setSt('Initializing AI Search Engine...','load',5);
   document.getElementById('dlbtn').classList.add('hidden');
+  document.getElementById('pvbox').classList.add('hidden');
   document.getElementById('btn-run').disabled=true;
+  tableShown = false;
 
   const payload = {
     location: loc, keyword: kw, max_leads: count,
@@ -532,11 +578,17 @@ async function startJob(){
         setTimeout(poll, 3000);
     }
     else if(d2.status==='sending_emails'){
-        setSt(d2.status_text, 'email', 100);
+        if(!tableShown && d2.leads) {
+            updStats(d2.leads); showPV(d2.leads); tableShown = true;
+            document.getElementById('dlbtn').classList.remove('hidden');
+        }
+        let emailPct = (d2.emails_sent / d2.total_to_send) * 100;
+        setSt(d2.status_text, 'email', Math.max(5, emailPct));
         setTimeout(poll, 3000);
     }
     else if(d2.status==='done'){
       document.getElementById('btn-run').disabled=false;
+      if(!tableShown && d2.leads) { updStats(d2.leads); showPV(d2.leads); }
       setSt(d2.status_text, 'done', 100);
       document.getElementById('dlbtn').classList.remove('hidden');
     } else if(d2.status==='error'){
@@ -568,7 +620,11 @@ def start_api_job():
 @flask_app.route('/api/status/<job_id>')
 def status(job_id):
     job = jobs.get(job_id, {'status': 'not_found'})
-    return jsonify(job)
+    out = dict(job)
+    # Send leads to UI for preview if scraping is done or emails are sending
+    if out.get('status') in ['sending_emails', 'done']:
+        out['leads'] = job.get('leads', [])
+    return jsonify(out)
 
 @flask_app.route('/api/download/<job_id>')
 def download(job_id):
@@ -587,7 +643,16 @@ def download(job_id):
 # ══════════════════════════════════════════════
 #   TELEGRAM BOT
 # ══════════════════════════════════════════════
-M_LOC, M_KW, M_COUNT = range(3)
+def to_csv(leads):
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8-sig', newline='')
+    if leads:
+        writer = csv.DictWriter(tmp, fieldnames=leads[0].keys())
+        writer.writeheader()
+        writer.writerows(leads)
+    tmp.close()
+    return tmp.name
+
+M_LOC, M_KW, M_COUNT, M_RATING = range(4)
 bot_store = {}
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -616,12 +681,89 @@ async def m_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if count > 200: count = 200
     uid = update.message.from_user.id
     bot_store[uid]['count'] = count
+    await update.message.reply_text("⭐ Max Rating Filter? (Type 'skip' to ignore, e.g. 3.5):")
+    return M_RATING
+
+async def m_rating(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.lower()
+    uid = update.message.from_user.id
+    bot_store[uid]['rating'] = None if txt == 'skip' else txt
     
     data = bot_store[uid]
-    txt_summary = f"📋 *Target Guarantee*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Target: {data['count']} Valid Emails\n\nStart Scraping?"
+    txt_summary = f"📋 *Target Guarantee*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Target: {data['count']} Valid Emails\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nStart Scraping?"
     kb = [[InlineKeyboardButton("✅ Start", callback_data="start_scrape")]]
     await update.message.reply_text(txt_summary, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
+
+async def background_bot_task(chat_id, message_id, data, bot):
+    try:
+        # Run the scraper loop without email automation parts for the bot
+        loop = asyncio.get_event_loop()
+        # We pass empty webhook/templates so it only does Phase 1
+        job_id = f"bot_{int(time.time())}"
+        jobs[job_id] = {}
+        
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="⏳ *Scraping & Deep Email Extraction running...*\n_AI will auto-expand keywords until target is reached._", parse_mode='Markdown')
+        
+        # Manually calling the logic to return leads directly
+        maps_lib = GoogleMapsScraper()
+        email_lib = DeepEmailExtractor()
+        final_leads = []
+        seen_names = set()
+        used_keywords = set()
+        pending_keywords = [data['kw']]
+        max_leads = data['count']
+        
+        while len(final_leads) < max_leads:
+            if not pending_keywords:
+                new_kws = generate_ai_keywords(data['kw'], data['loc'], used_keywords)
+                pending_keywords.extend(new_kws)
+                
+            current_kw = pending_keywords.pop(0)
+            used_keywords.add(current_kw.lower())
+            
+            start = 0
+            empty_strikes = 0
+            while start <= 300 and len(final_leads) < max_leads:
+                raw_batch = await loop.run_in_executor(None, maps_lib.get_page, current_kw, data['loc'], start)
+                if not raw_batch:
+                    empty_strikes += 1
+                    if empty_strikes >= 2: break
+                else:
+                    empty_strikes = 0
+                    
+                for lead in raw_batch:
+                    if len(final_leads) >= max_leads: break
+                    if lead['Name'] in seen_names: continue
+                    if data.get('rating') and lead['Rating'] != "N/A":
+                        try:
+                            if float(lead['Rating']) > float(data.get('rating')): continue
+                        except: continue
+                    if lead['Website'] == 'N/A': continue
+                    email = await loop.run_in_executor(None, email_lib.get_email, lead['Website'])
+                    if email == "N/A": continue
+                    
+                    lead['Email'] = email
+                    seen_names.add(lead['Name'])
+                    final_leads.append(lead)
+                start += 20
+                await asyncio.sleep(1.5)
+            await asyncio.sleep(2)
+            
+        if not final_leads:
+            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="😔 No results found.")
+            return
+
+        path = to_csv(final_leads)
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="✅ Done! Sending file...")
+        with open(path, 'rb') as f:
+            await bot.send_document(
+                chat_id=chat_id, document=f, filename=f"Target_Leads.csv",
+                caption=f"🎯 *Target Reached!*\n📊 Total Valid Emails: {len(final_leads)}", parse_mode='Markdown'
+            )
+        os.unlink(path)
+    except Exception as e:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=f"❌ Error: `{e}`", parse_mode='Markdown')
 
 async def execute_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -629,15 +771,10 @@ async def execute_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     data = bot_store.get(uid)
     
-    msg = await q.edit_message_text("⏳ *Scraping & Deep Email Extraction running...*\n_AI will auto-expand keywords until target is reached._", parse_mode='Markdown')
+    msg = await q.edit_message_text("⏳ *Initializing background task...*", parse_mode='Markdown')
     
     # Run in background to not block bot
-    job_id = f"bot_{uid}_{int(time.time())}"
-    t = threading.Thread(target=run_job_thread, args=(job_id, {'location': data['loc'], 'keyword': data['kw'], 'max_leads': data['count']}))
-    t.daemon = True
-    t.start()
-    
-    await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text=f"✅ Task started in background! Check Web Dashboard for live status or wait for completion notification.")
+    asyncio.create_task(background_bot_task(q.message.chat_id, msg.message_id, data, ctx.bot))
 
 def run_telegram_bot():
     loop = asyncio.new_event_loop()
@@ -649,7 +786,8 @@ def run_telegram_bot():
         states={
             M_LOC: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_loc)],
             M_KW: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_kw)],
-            M_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_count)]
+            M_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_count)],
+            M_RATING: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_rating)]
         },
         fallbacks=[],
         per_message=False,
