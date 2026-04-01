@@ -1,5 +1,6 @@
 import os, csv, asyncio, tempfile, threading, io, uuid, re, time, json, urllib.parse, random
 import requests
+import concurrent.futures
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from groq import Groq
@@ -9,7 +10,6 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 )
-from playwright.sync_api import sync_playwright # <-- SWITCHED TO SYNC API TO PREVENT FREEZING
 
 load_dotenv()
 
@@ -33,122 +33,66 @@ def get_headers():
     }
 
 # ══════════════════════════════════════════════
-#   1. ROBUST SYNC GOOGLE MAPS SCRAPER
+#   1. SUPER FAST PURE PYTHON SCRAPER (NO BROWSER NEEDED)
 # ══════════════════════════════════════════════
 class GoogleMapsScraper:
-    def __init__(self, context):
-        self.context = context
-
-    def safe_extract(self, page, selector, attribute="innerText"):
-        """Safely extracts data using modern Playwright locators."""
-        try:
-            element = page.locator(selector).first
-            if element.count() > 0:
-                if attribute == "innerText":
-                    return element.inner_text(timeout=2000)
-                else:
-                    return element.get_attribute(attribute, timeout=2000)
-        except Exception:
-            pass
-        return "N/A"
-
-    def scrape_keyword(self, keyword, location, max_leads, seen_names, job_id, jobs_dict, email_lib, max_rating):
-        """Scrolls Google Maps and extracts leads synchronously."""
-        page = self.context.new_page()
-        try:
-            query = f"{keyword} in {location}".replace(" ", "+")
-            url = f"https://www.google.com/maps/search/{query}"
-            
-            jobs_dict[job_id]['status_text'] = f"Searching Maps for: {keyword}..."
-            page.goto(url, timeout=60000)
-            page.wait_for_timeout(3000) # Wait for initial load
-
-            # 1. Scroll the sidebar and collect business URLs
-            business_urls = []
+    def fetch_batch(self, keyword, location):
+        """Fetches multiple pages concurrently for blazing fast speed."""
+        query = urllib.parse.quote_plus(f"{keyword} in {location}")
+        all_leads = []
+        
+        def get_offset(start):
+            url = f"https://www.google.com/search?q={query}&tbm=lcl&start={start}&num=20&hl=en"
             try:
-                page.hover('a[href*="https://www.google.com/maps/place/"]')
-            except:
-                pass
-
-            scroll_attempts = 0
-            while len(business_urls) < max_leads and scroll_attempts < 15:
-                page.mouse.wheel(0, 5000)
-                page.wait_for_timeout(1500)
+                res = requests.get(url, headers=get_headers(), timeout=10)
+                soup = BeautifulSoup(res.text, 'html.parser')
+                blocks = soup.select('div.VkpGBb, div.rllt__details, div.uMdZh, div.cXedhc')
+                batch = []
                 
-                links = page.locator('a[href*="https://www.google.com/maps/place/"]').all()
-                for link in links:
-                    href = link.get_attribute('href')
-                    if href and href not in business_urls:
-                        business_urls.append(href)
-                
-                # Check if we hit the end of the list
-                if page.locator("text=You've reached the end of the list").is_visible():
-                    break
-                scroll_attempts += 1
-
-            # 2. Visit each URL and extract detailed data
-            for url in business_urls:
-                current_leads = jobs_dict[job_id].get('leads', [])
-                if len(current_leads) >= max_leads:
-                    break
+                for block in blocks:
+                    text_content = block.get_text(separator=' ', strip=True)
                     
-                page.goto(url, timeout=60000)
-                page.wait_for_timeout(1500)
-                
-                # Extract Name
-                name = self.safe_extract(page, 'h1')
-                if name == "N/A" or name in seen_names:
-                    continue
+                    name_el = block.select_one('div[role="heading"], .dbg0pd, span.OSrXXb')
+                    name = name_el.get_text(strip=True) if name_el else "N/A"
+                    if name == "N/A" or len(name) < 3: continue
                     
-                jobs_dict[job_id]['status_text'] = f"Extracting data for: {name}..."
-                
-                # Extract Rating
-                rating_text = self.safe_extract(page, 'div.F7nice')
-                rating = "N/A"
-                if rating_text != "N/A" and "\n" in rating_text:
-                    rating = rating_text.split("\n")[0]
+                    rating_match = re.search(r'(\d[\.,]\d)\s*[\(\d]', text_content)
+                    rating = rating_match.group(1).replace(',', '.') if rating_match else "N/A"
                     
-                # Apply Rating Filter
-                if max_rating and rating != "N/A":
-                    try:
-                        if float(rating) > float(max_rating): continue
-                    except: pass
+                    # Improved Phone Regex
+                    ph = re.search(r'(\+?\d{1,3}[\s\-\(\)]?\d{3,4}[\s\-\(\)]?\d{3,4}[\s\-\(\)]?\d{3,4})', text_content)
+                    phone = ph.group(0).strip() if ph else "N/A"
+                    
+                    website = "N/A"
+                    for a in block.select('a[href]'):
+                        href = a['href']
+                        if '/url?q=' in href:
+                            clean = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
+                            if 'google' not in clean.lower() and clean.startswith('http'):
+                                website = clean; break
+                        elif href.startswith('http') and 'google' not in href.lower():
+                            website = href; break
+                            
+                    batch.append({
+                        "Name": name,
+                        "Phone": phone,
+                        "Website": website,
+                        "Rating": rating,
+                        "Address": location,
+                        "Category": keyword,
+                        "Maps_Link": f"https://www.google.com/maps/search/{urllib.parse.quote_plus(name + ' ' + location)}"
+                    })
+                return batch
+            except Exception:
+                return []
 
-                # Extract Phone & Website
-                phone = self.safe_extract(page, 'button[data-item-id^="phone:tel:"]', "innerText")
-                if phone != "N/A": phone = phone.replace("\u200e", "").strip()
+        # Fetch 5 pages (100 results) at the exact same time using Multi-threading
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            results = executor.map(get_offset, [0, 20, 40, 60, 80])
+            for res in results:
+                all_leads.extend(res)
                 
-                website = self.safe_extract(page, 'a[data-item-id="authority"]', "href")
-                
-                # Extract Email (Do not skip if missing, just mark as N/A to prevent freezing)
-                email = "N/A"
-                if website != "N/A":
-                    jobs_dict[job_id]['status_text'] = f"Hunting email for: {name}..."
-                    email = email_lib.get_email(website)
-                    
-                lead = {
-                    "Name": name,
-                    "Phone": phone,
-                    "Website": website,
-                    "Email": email,
-                    "Rating": rating,
-                    "Address": location,
-                    "Category": keyword,
-                    "Maps_Link": url
-                }
-                
-                seen_names.add(name)
-                
-                # Update global job state for real-time UI updates
-                current_leads.append(lead)
-                jobs_dict[job_id]['leads'] = current_leads
-                jobs_dict[job_id]['count'] = len(current_leads)
-                jobs_dict[job_id]['status_text'] = f"Found {len(current_leads)}/{max_leads} leads... (Latest: {name})"
-
-        except Exception as e:
-            print(f"Error scraping {keyword}: {e}")
-        finally:
-            page.close()
+        return all_leads
 
 # ══════════════════════════════════════════════
 #   2. DEEP EMAIL EXTRACTOR LIBRARY
@@ -161,7 +105,7 @@ class DeepEmailExtractor:
         if not url or url == "N/A": return "N/A"
         if not url.startswith('http'): url = 'http://' + url
         try:
-            r = requests.get(url, headers=get_headers(), timeout=8, verify=False)
+            r = requests.get(url, headers=get_headers(), timeout=5, verify=False)
             emails = list(set(re.findall(self.email_regex, r.text)))
             valid = [e for e in emails if not any(x in e.lower() for x in ['example','domain','sentry','@2x','.png','.jpg','wixpress'])]
             if valid: return valid[0]
@@ -170,7 +114,7 @@ class DeepEmailExtractor:
             for a in soup.select('a[href]'):
                 if 'contact' in a.get('href', '').lower():
                     clink = urllib.parse.urljoin(url, a['href'])
-                    r2 = requests.get(clink, headers=get_headers(), timeout=8, verify=False)
+                    r2 = requests.get(clink, headers=get_headers(), timeout=5, verify=False)
                     emails2 = list(set(re.findall(self.email_regex, r2.text)))
                     valid2 = [e for e in emails2 if not any(x in e.lower() for x in ['example','domain','sentry','@2x','.png','.jpg'])]
                     if valid2: return valid2[0]
@@ -237,9 +181,10 @@ def run_job_thread(job_id, data):
         webhook_url = data.get('webhook_url')
         templates = data.get('templates', [])
         
+        maps_scraper = GoogleMapsScraper()
         email_lib = DeepEmailExtractor()
         
-        jobs[job_id] = {'status': 'scraping', 'count': 0, 'leads': [], 'status_text': 'Starting browser engine...'}
+        jobs[job_id] = {'status': 'scraping', 'count': 0, 'leads': [], 'status_text': 'Starting Fast Engine...'}
         
         seen_names = set()
         used_keywords = set()
@@ -247,42 +192,44 @@ def run_job_thread(job_id, data):
         kw_attempts = 0
         max_kw_attempts = 10
         
-        # Start Synchronous Playwright
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080}
-            )
+        # --- PHASE 1: FAST SCRAPING ---
+        while len(jobs[job_id]['leads']) < max_leads and kw_attempts < max_kw_attempts:
+            if not pending_keywords:
+                jobs[job_id]['status_text'] = f"Generating new keywords for '{base_keyword}'..."
+                new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
+                pending_keywords.extend(new_kws)
+                
+            current_kw = pending_keywords.pop(0)
+            used_keywords.add(current_kw.lower())
+            kw_attempts += 1
             
-            # Block heavy resources for speed
-            context.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
+            jobs[job_id]['status_text'] = f"Fast fetching 100+ results for: {current_kw}..."
+            raw_leads = maps_scraper.fetch_batch(current_kw, location)
             
-            maps_scraper = GoogleMapsScraper(context)
-            
-            # --- PHASE 1: SCRAPING ---
-            while len(jobs[job_id]['leads']) < max_leads and kw_attempts < max_kw_attempts:
-                if not pending_keywords:
-                    jobs[job_id]['status_text'] = f"Generating new keywords for '{base_keyword}'..."
-                    new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
-                    pending_keywords.extend(new_kws)
+            for lead in raw_leads:
+                if len(jobs[job_id]['leads']) >= max_leads:
+                    break
                     
-                current_kw = pending_keywords.pop(0)
-                used_keywords.add(current_kw.lower())
-                kw_attempts += 1
+                if lead['Name'] in seen_names:
+                    continue
+                    
+                # Apply Rating Filter
+                if max_rating and lead['Rating'] != "N/A":
+                    try:
+                        if float(lead['Rating']) > float(max_rating): continue
+                    except: pass
+
+                jobs[job_id]['status_text'] = f"Extracting email for: {lead['Name']}..."
                 
-                maps_scraper.scrape_keyword(
-                    keyword=current_kw, 
-                    location=location, 
-                    max_leads=max_leads, 
-                    seen_names=seen_names, 
-                    job_id=job_id, 
-                    jobs_dict=jobs, 
-                    email_lib=email_lib, 
-                    max_rating=max_rating
-                )
+                # Extract Email (Non-blocking, saves even if N/A)
+                lead['Email'] = email_lib.get_email(lead['Website'])
                 
-            browser.close()
+                seen_names.add(lead['Name'])
+                jobs[job_id]['leads'].append(lead)
+                jobs[job_id]['count'] = len(jobs[job_id]['leads'])
+                jobs[job_id]['status_text'] = f"Found {len(jobs[job_id]['leads'])}/{max_leads} leads... (Latest: {lead['Name']})"
+                
+            time.sleep(1) # Small delay between keyword searches
             
         final_leads = jobs[job_id]['leads']
         
@@ -410,7 +357,7 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
         <div><label class="text-xs text-slate-500 mb-1.5 block">⭐ Max Rating (Optional - For Bad Reviews)</label><input id="m-rating" type="number" step="0.1" class="inp" placeholder="e.g. 3.5"></div>
       </div>
       <div class="p-3 mb-4 rounded-xl text-xs" style="background:rgba(239,68,68,0.07);border:1px solid rgba(239,68,68,0.2);color:#f87171">
-        <i class="fa-solid fa-shield-halved mr-1"></i> <b>Smart Mode:</b> Extracts all leads. AI will auto-expand keywords until target is reached.
+        <i class="fa-solid fa-bolt mr-1"></i> <b>Fast Mode:</b> Extracts all leads instantly. AI will auto-expand keywords until target is reached.
       </div>
       <button onclick="startJob()" id="btn-run" class="btn-p w-full py-3 rounded-xl text-sm"><i class="fa-solid fa-play mr-2"></i>Start Scraping & Automation</button>
     </div>
@@ -736,7 +683,7 @@ bot_store = {}
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("🚀 Start Search", callback_data="start_manual")]]
-    await update.message.reply_text("👋 *LeadGen Pro Bot*\n\n✅ Smart Mode Extraction\n✅ Auto AI Keyword Expansion\n✅ Max Limit: 200\n\n_Note: For Email Automation, please use the Web Dashboard._", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("👋 *LeadGen Pro Bot*\n\n✅ Fast Mode Extraction\n✅ Auto AI Keyword Expansion\n✅ Max Limit: 200\n\n_Note: For Email Automation, please use the Web Dashboard._", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
 
 async def handle_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -774,59 +721,54 @@ async def m_rating(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(txt_summary, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
 
-def run_bot_scrape_sync(data):
-    """Runs the synchronous Playwright scraper for the Telegram Bot."""
+def run_bot_scrape_fast(data):
+    """Runs the fast pure python scraper for the Telegram Bot."""
     location = data['loc']
     base_keyword = data['kw']
     max_leads = data['count']
     max_rating = data.get('rating')
     
+    maps_scraper = GoogleMapsScraper()
     email_lib = DeepEmailExtractor()
+    
     seen_names = set()
     used_keywords = set()
     pending_keywords = [base_keyword]
     kw_attempts = 0
+    final_leads = []
     
-    dummy_job_id = "bot_job"
-    dummy_jobs = {dummy_job_id: {'leads': [], 'status_text': ''}}
-    
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        context = browser.new_context(viewport={"width": 1920, "height": 1080})
-        context.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
-        
-        maps_scraper = GoogleMapsScraper(context)
-        
-        while len(dummy_jobs[dummy_job_id]['leads']) < max_leads and kw_attempts < 10:
-            if not pending_keywords:
-                new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
-                pending_keywords.extend(new_kws)
-                
-            current_kw = pending_keywords.pop(0)
-            used_keywords.add(current_kw.lower())
-            kw_attempts += 1
+    while len(final_leads) < max_leads and kw_attempts < 10:
+        if not pending_keywords:
+            new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
+            pending_keywords.extend(new_kws)
             
-            maps_scraper.scrape_keyword(
-                keyword=current_kw, 
-                location=location, 
-                max_leads=max_leads, 
-                seen_names=seen_names, 
-                job_id=dummy_job_id, 
-                jobs_dict=dummy_jobs, 
-                email_lib=email_lib, 
-                max_rating=max_rating
-            )
-        browser.close()
+        current_kw = pending_keywords.pop(0)
+        used_keywords.add(current_kw.lower())
+        kw_attempts += 1
         
-    return dummy_jobs[dummy_job_id]['leads']
+        raw_leads = maps_scraper.fetch_batch(current_kw, location)
+        
+        for lead in raw_leads:
+            if len(final_leads) >= max_leads: break
+            if lead['Name'] in seen_names: continue
+            
+            if max_rating and lead['Rating'] != "N/A":
+                try:
+                    if float(lead['Rating']) > float(max_rating): continue
+                except: pass
+                
+            lead['Email'] = email_lib.get_email(lead['Website'])
+            seen_names.add(lead['Name'])
+            final_leads.append(lead)
+            
+    return final_leads
 
 async def background_bot_task(chat_id, message_id, data, bot):
     try:
-        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="⏳ *Scraping & Deep Email Extraction running...*\n_AI will auto-expand keywords until target is reached._", parse_mode='Markdown')
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="⏳ *Fast Scraping & Deep Email Extraction running...*\n_AI will auto-expand keywords until target is reached._", parse_mode='Markdown')
         
-        # Run the synchronous scraper in a separate thread to avoid blocking the Telegram event loop
         loop = asyncio.get_event_loop()
-        final_leads = await loop.run_in_executor(None, run_bot_scrape_sync, data)
+        final_leads = await loop.run_in_executor(None, run_bot_scrape_fast, data)
         
         if not final_leads:
             await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="😔 No results found.")
