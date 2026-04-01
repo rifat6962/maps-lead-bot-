@@ -1,8 +1,7 @@
-import os, csv, asyncio, tempfile, threading, io, uuid, re, time, json
+import os, csv, asyncio, tempfile, threading, io, uuid, re, time, json, urllib.parse
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from apify_client import ApifyClient
 from groq import Groq
 from flask import Flask, render_template_string, request, send_file, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -16,8 +15,12 @@ load_dotenv()
 # Global Config
 CONFIG = {
     "TELEGRAM_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN"),
-    "APIFY_TOKEN": os.getenv("APIFY_API_TOKEN", ""),
     "GROQ_API_KEY": os.getenv("GROQ_API_KEY", "")
+}
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9"
 }
 
 # ══════════════════════════════════════════════
@@ -34,13 +37,12 @@ def parse_with_ai(user_text):
     - loc: The location (e.g., Canada, Dhaka, Texas)
     - kw: The niche or keyword (e.g., car showroom, plumber)
     - count: Number of leads requested (integer, default is 50)
-    - rating: Maximum rating requested (float, e.g., 3.0, 4.5. If they say 'maximum 3 star', it's 3.0)
-    - reviews: Minimum reviews requested (integer)
+    - rating: Maximum rating requested (float, e.g., 3.0, 4.5)
 
     User input: "{user_text}"
 
     Return ONLY a valid JSON object. Do not include any other text.
-    Example format: {{"loc": "Canada", "kw": "car showroom", "count": 50, "rating": 3.0, "reviews": null}}
+    Example format: {{"loc": "Canada", "kw": "car showroom", "count": 50, "rating": 3.0}}
     """
     
     try:
@@ -55,21 +57,22 @@ def parse_with_ai(user_text):
             return json.loads(json_match.group(0))
         return json.loads(response)
     except Exception as e:
-        print(f"Groq Error: {e}")
         raise Exception("Failed to connect to Groq AI. Please check your API Key in Settings.")
 
 # ══════════════════════════════════════════════
-#   DEEP EMAIL EXTRACTOR (PYTHON FALLBACK)
+#   DEEP EMAIL EXTRACTOR (PYTHON)
 # ══════════════════════════════════════════════
 EMAIL_REGEX = r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 def extract_email_from_website(url):
     if not url or url == "N/A": return "N/A"
     try:
         r = requests.get(url, headers=HEADERS, timeout=8)
-        emails = re.findall(EMAIL_REGEX, r.text)
-        if emails: return emails[0]
+        emails = list(set(re.findall(EMAIL_REGEX, r.text)))
+        
+        # Filter out dummy emails
+        valid_emails = [e for e in emails if not any(x in e.lower() for x in ['example', 'domain', 'sentry', '@2x', '.png', '.jpg'])]
+        if valid_emails: return valid_emails[0]
         
         soup = BeautifulSoup(r.text, 'html.parser')
         contact_link = None
@@ -82,61 +85,93 @@ def extract_email_from_website(url):
             if not contact_link.startswith('http'):
                 contact_link = url.rstrip('/') + '/' + contact_link.lstrip('/')
             r2 = requests.get(contact_link, headers=HEADERS, timeout=8)
-            emails2 = re.findall(EMAIL_REGEX, r2.text)
-            if emails2: return emails2[0]
+            emails2 = list(set(re.findall(EMAIL_REGEX, r2.text)))
+            valid_emails2 = [e for e in emails2 if not any(x in e.lower() for x in ['example', 'domain', 'sentry', '@2x'])]
+            if valid_emails2: return valid_emails2[0]
     except:
         pass
     return "N/A"
 
 # ══════════════════════════════════════════════
-#   ADVANCED SCRAPER (HUMBLE VACATION TASK)
+#   100% FREE CUSTOM SCRAPER
 # ══════════════════════════════════════════════
-def scrape_advanced(location, keyword, max_leads=50, max_rating=None, min_reviews=None):
-    if not CONFIG["APIFY_TOKEN"]:
-        raise Exception("Apify API Token is missing! Please set it in settings.")
-        
-    client = ApifyClient(CONFIG["APIFY_TOKEN"])
+def scrape_free(location, keyword, max_leads=50, max_rating=None):
+    results = []
+    query = f"{keyword} in {location}"
+    encoded = urllib.parse.quote(query)
     
-    # FIX: Using client.task() instead of client.actor() because of "-task" in the name
+    # 1. Scrape Google Search Local Pack (Fallback Method)
+    url = f"https://www.google.com/search?q={encoded}&num=30"
+    
     try:
-        run = client.task("humble_vacation/google-maps-email-task").call(run_input={
-            "searchStringsArray": [f"{keyword} in {location}"],
-            "maxCrawledPlacesPerSearch": int(max_leads),
-            "language": "en",
-        })
+        response = requests.get(url, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Find business blocks
+        for div in soup.find_all('div', class_=['VkpGBb', 'rllt__details', 'dbg0pd']):
+            try:
+                name_el = div.find(['h3', 'span', 'a'])
+                name = name_el.get_text(strip=True) if name_el else 'N/A'
+                
+                text = div.get_text(separator=' ', strip=True)
+                
+                # Extract Phone
+                phone_match = re.search(r'(\+?8801[3-9]\d{8}|01[3-9]\d{8}|\+?\d[\d\s\-\(\)]{8,})', text)
+                phone = phone_match.group(1).strip() if phone_match else 'N/A'
+                
+                # Extract Rating
+                rating_match = re.search(r'(\d\.\d)\s*\(', text)
+                rating = rating_match.group(1) if rating_match else "N/A"
+                
+                # Filter by Rating
+                if max_rating and rating != "N/A" and float(rating) > float(max_rating):
+                    continue
+                
+                # Extract Website Link
+                website = "N/A"
+                for a in div.find_all('a', href=True):
+                    if 'url?q=' in a['href'] and 'google.com' not in a['href']:
+                        website = a['href'].split('url?q=')[1].split('&')[0]
+                        break
+                    elif a['href'].startswith('http') and 'google.com' not in a['href']:
+                        website = a['href']
+                        break
+                
+                # Deep Email Extract
+                email = "N/A"
+                if website != "N/A":
+                    email = extract_email_from_website(website)
+                    time.sleep(0.5)
+                
+                if name and name != 'N/A':
+                    results.append({
+                        "Name": name,
+                        "Phone": phone,
+                        "Email": email,
+                        "Address": "N/A",
+                        "Category": keyword,
+                        "Rating": rating,
+                        "Reviews": "N/A",
+                        "Website": website,
+                        "Maps_Link": f"https://www.google.com/maps/search/{urllib.parse.quote(name + ' ' + location)}"
+                    })
+                    
+                if len(results) >= int(max_leads):
+                    break
+            except Exception:
+                continue
     except Exception as e:
-        raise Exception(f"Apify Error: {str(e)}. Please check if the Task name is correct in your Apify account.")
-    
-    leads = []
-    for item in client.dataset(run["defaultDatasetId"]).iterate_items():
-        rating = item.get("totalScore", 0)
-        reviews = item.get("reviewsCount", 0)
-        
-        if max_rating and rating and float(rating) > float(max_rating): continue
-        if min_reviews and reviews and int(reviews) < int(min_reviews): continue
-        
-        website = item.get("website", "N/A")
-        
-        email = item.get("email") or item.get("emails", [])
-        if isinstance(email, list) and len(email) > 0:
-            email = email[0]
-            
-        if (not email or email == "N/A") and website != "N/A":
-            email = extract_email_from_website(website)
-            time.sleep(0.5) 
-            
-        leads.append({
-            "Name": item.get("title", "N/A"),
-            "Phone": item.get("phone", "N/A"),
-            "Email": email if email else "N/A",
-            "Address": item.get("address", "N/A"),
-            "Category": item.get("categoryName", "N/A"),
-            "Rating": rating if rating else "N/A",
-            "Reviews": reviews if reviews else "N/A",
-            "Website": website,
-            "Maps_Link": item.get("url", "N/A"),
-        })
-    return leads
+        print(f"Search API error: {e}")
+
+    # Remove duplicates
+    seen = set()
+    unique_results = []
+    for r in results:
+        if r['Name'] not in seen:
+            seen.add(r['Name'])
+            unique_results.append(r)
+
+    return unique_results[:int(max_leads)]
 
 # ══════════════════════════════════════════════
 #   WEB DASHBOARD (FLASK + DARK TAILWIND CSS)
@@ -150,7 +185,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pro Lead Gen Agent</title>
+    <title>Pro Lead Gen Agent (Free Edition)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <script>
@@ -180,7 +215,10 @@ HTML_TEMPLATE = """
         <header class="flex justify-between items-center bg-darkcard p-5 rounded-2xl shadow-lg mb-8 border border-gray-800">
             <div class="flex items-center gap-4">
                 <div class="bg-gradient-to-br from-indigo-500 to-purple-600 text-white p-3 rounded-xl shadow-lg"><i class="fa-solid fa-map-location-dot text-2xl"></i></div>
-                <h1 class="text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-purple-400">LeadGen Pro</h1>
+                <div>
+                    <h1 class="text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-purple-400">LeadGen Pro</h1>
+                    <span class="text-xs font-bold bg-green-500 text-white px-2 py-1 rounded-full">100% Free Edition</span>
+                </div>
             </div>
             <button onclick="switchTab('settings')" class="text-gray-400 hover:text-white transition bg-gray-800 p-3 rounded-xl border border-gray-700"><i class="fa-solid fa-gear text-xl"></i></button>
         </header>
@@ -197,7 +235,7 @@ HTML_TEMPLATE = """
             <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
                 <div><label class="block text-sm font-medium mb-2 text-gray-400">Location *</label><input id="m-loc" type="text" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., New York, NY"></div>
                 <div><label class="block text-sm font-medium mb-2 text-gray-400">Keyword *</label><input id="m-kw" type="text" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., Real Estate Agency"></div>
-                <div><label class="block text-sm font-medium mb-2 text-gray-400">Number of Leads</label><input id="m-count" type="number" value="50" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none"></div>
+                <div><label class="block text-sm font-medium mb-2 text-gray-400">Number of Leads (Max 30 for Free)</label><input id="m-count" type="number" value="30" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none"></div>
                 <div><label class="block text-sm font-medium mb-2 text-gray-400">Max Rating (Optional)</label><input id="m-rating" type="number" step="0.1" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., 4.5"></div>
             </div>
             <button onclick="startManual()" id="btn-manual" class="w-full bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 text-white font-bold py-4 rounded-xl shadow-lg transition text-lg"><i class="fa-solid fa-rocket mr-2"></i> Start Scraping</button>
@@ -212,7 +250,7 @@ HTML_TEMPLATE = """
                 <div class="flex gap-4">
                     <div class="bg-darkcard border border-gray-700 text-gray-200 p-4 rounded-2xl rounded-tl-none max-w-[85%] shadow-md">
                         Hello! I am your AI Agent powered by Groq. Tell me exactly what you need in plain English.<br><br>
-                        <span class="text-indigo-400 italic">Example: "I need 50 leads for car showrooms in Canada with maximum 3 star rating."</span>
+                        <span class="text-indigo-400 italic">Example: "I need 30 leads for car showrooms in Canada with maximum 3 star rating."</span>
                     </div>
                 </div>
             </div>
@@ -226,9 +264,8 @@ HTML_TEMPLATE = """
         <div id="content-settings" class="hidden bg-darkcard p-8 rounded-2xl shadow-xl border border-gray-800">
             <h2 class="text-2xl font-bold mb-6 text-white flex items-center gap-2"><i class="fa-solid fa-key text-yellow-500"></i> API Settings</h2>
             <div class="space-y-6">
-                <div>
-                    <label class="block text-sm font-medium mb-2 text-gray-400">Apify API Token</label>
-                    <input id="api-key" type="password" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="Enter Apify Token">
+                <div class="bg-green-900/30 border border-green-500/50 p-4 rounded-xl text-green-400 mb-4">
+                    <i class="fa-solid fa-check-circle mr-2"></i> Apify is removed! The scraper is now 100% Free.
                 </div>
                 <div>
                     <label class="block text-sm font-medium mb-2 text-gray-400">Groq API Key (For AI Brain)</label>
@@ -265,12 +302,11 @@ HTML_TEMPLATE = """
         }
 
         function saveSettings() {
-            const apify = document.getElementById('api-key').value;
             const groq = document.getElementById('groq-key').value;
             fetch('/api/settings', { 
                 method: 'POST', 
                 headers: {'Content-Type':'application/json'}, 
-                body: JSON.stringify({apify: apify, groq: groq}) 
+                body: JSON.stringify({groq: groq}) 
             }).then(() => alert('Settings Saved Successfully!'));
         }
 
@@ -291,7 +327,7 @@ HTML_TEMPLATE = """
         }
 
         async function startJob(payload) {
-            showStatus('Initializing Apify Extractor & Deep Python Fallback...');
+            showStatus('Scraping data & extracting deep emails (100% Free)...');
             const res = await fetch('/api/scrape', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
             const data = await res.json();
             if(data.error) return showStatus(data.error, false, true);
@@ -307,7 +343,7 @@ HTML_TEMPLATE = """
             
             startJob({
                 location: loc, keyword: kw,
-                max_leads: document.getElementById('m-count').value || 50,
+                max_leads: document.getElementById('m-count').value || 30,
                 max_rating: document.getElementById('m-rating').value || null
             });
         }
@@ -379,7 +415,7 @@ HTML_TEMPLATE = """
                     🔢 <b>Leads:</b> ${aiState.count}<br>`;
                     if(aiState.rating) summary += `⭐ <b>Max Rating:</b> ${aiState.rating}<br>`;
                     
-                    summary += `<br><button onclick='startJob(${JSON.stringify({location: aiState.loc, keyword: aiState.kw, max_leads: aiState.count, max_rating: aiState.rating})})' class='mt-3 bg-gradient-to-r from-green-500 to-emerald-600 text-white px-6 py-2 rounded-lg font-bold shadow hover:shadow-lg transition'>🚀 Start Automation</button>`;
+                    summary += `<br><button onclick='startJob(${JSON.stringify({location: aiState.loc, keyword: aiState.kw, max_leads: aiState.count, max_rating: aiState.rating})})' class='mt-3 bg-gradient-to-r from-green-500 to-emerald-600 text-white px-6 py-2 rounded-lg font-bold shadow hover:shadow-lg transition'>🚀 Start Free Automation</button>`;
                     
                     addMsg(summary, true, true);
                 } else {
@@ -401,7 +437,6 @@ def index():
 
 @flask_app.route('/api/settings', methods=['POST'])
 def update_settings():
-    if request.json.get('apify'): CONFIG["APIFY_TOKEN"] = request.json.get('apify')
     if request.json.get('groq'): CONFIG["GROQ_API_KEY"] = request.json.get('groq')
     return jsonify({"success": True})
 
@@ -437,12 +472,11 @@ def handle_chat():
 def run_scrape_thread(job_id, data):
     try:
         jobs[job_id] = {'status': 'running'}
-        leads = scrape_advanced(
+        leads = scrape_free(
             data.get('location'), 
             data.get('keyword'),
-            data.get('max_leads', 50),
-            data.get('max_rating'),
-            data.get('min_reviews')
+            data.get('max_leads', 30),
+            data.get('max_rating')
         )
         jobs[job_id] = {'status': 'done', 'leads': leads, 'count': len(leads)}
     except Exception as e:
@@ -467,12 +501,14 @@ def download(job_id):
     job = jobs.get(job_id)
     if not job or job['status'] != 'done': return "Not ready", 400
     leads = job['leads']
+    if not leads: return "No leads found", 404
+    
     out = io.StringIO()
     writer = csv.DictWriter(out, fieldnames=leads[0].keys())
     writer.writeheader()
     writer.writerows(leads)
     out.seek(0)
-    return send_file(io.BytesIO(out.getvalue().encode('utf-8-sig')), mimetype='text/csv', as_attachment=True, download_name='advanced_leads.csv')
+    return send_file(io.BytesIO(out.getvalue().encode('utf-8-sig')), mimetype='text/csv', as_attachment=True, download_name='free_leads.csv')
 
 # ══════════════════════════════════════════════
 #   TELEGRAM BOT
@@ -493,7 +529,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🛠️ Manual Search", callback_data="mode_manual")],
         [InlineKeyboardButton("🤖 Groq AI Search", callback_data="mode_ai")]
     ]
-    await update.message.reply_text("👋 *Pro Lead Gen Bot*\n\nকীভাবে সার্চ করতে চাও?", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("👋 *Pro Lead Gen Bot (100% Free)*\n\nকীভাবে সার্চ করতে চাও?", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
 
 async def handle_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -505,7 +541,7 @@ async def handle_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("📍 *Manual Mode*\nLocation দাও (e.g. Dhaka):", parse_mode='Markdown')
         return M_LOC
     else:
-        await q.edit_message_text("🤖 *Groq AI Mode*\nআমাকে ইংরেজিতে বলো তুমি কী খুঁজছো।\n\n_Example: I need 50 leads for car showrooms in Canada with maximum 3 star rating_", parse_mode='Markdown')
+        await q.edit_message_text("🤖 *Groq AI Mode*\nআমাকে ইংরেজিতে বলো তুমি কী খুঁজছো।\n\n_Example: I need 30 leads for car showrooms in Canada with maximum 3 star rating_", parse_mode='Markdown')
         return AI_PROMPT
 
 async def m_loc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -515,7 +551,7 @@ async def m_loc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def m_kw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot_store[update.message.from_user.id]['kw'] = update.message.text
-    await update.message.reply_text("🔢 কয়টা লিড লাগবে? (e.g. 50, 100):")
+    await update.message.reply_text("🔢 কয়টা লিড লাগবে? (Max 30):")
     return M_COUNT
 
 async def m_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -544,7 +580,7 @@ async def ai_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bot_store[uid] = {
             'loc': parsed['loc'],
             'kw': parsed['kw'],
-            'count': parsed.get('count', 50),
+            'count': parsed.get('count', 30),
             'rating': parsed.get('rating')
         }
         await msg.delete()
@@ -555,7 +591,7 @@ async def ai_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def ask_confirm(update, uid):
     data = bot_store[uid]
-    txt = f"📋 *Summary*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Leads: {data['count']}\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nশুরু করবো?"
+    txt = f"📋 *Summary (Free Scraper)*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Leads: {data['count']}\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nশুরু করবো?"
     kb = [[InlineKeyboardButton("✅ Start Automation", callback_data="start_scrape")]]
     await update.message.reply_text(txt, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
@@ -570,7 +606,7 @@ async def execute_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     try:
         loop = asyncio.get_event_loop()
-        leads = await loop.run_in_executor(None, scrape_advanced, data['loc'], data['kw'], data['count'], data.get('rating'))
+        leads = await loop.run_in_executor(None, scrape_free, data['loc'], data['kw'], data['count'], data.get('rating'))
         
         if not leads:
             return await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text="😔 কোনো result নেই।")
@@ -581,7 +617,7 @@ async def execute_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text="✅ হয়ে গেছে! ফাইল পাঠাচ্ছি...")
         with open(path, 'rb') as f:
             await ctx.bot.send_document(
-                chat_id=q.message.chat_id, document=f, filename=f"leads.csv",
+                chat_id=q.message.chat_id, document=f, filename=f"free_leads.csv",
                 caption=f"🎯 *Done!*\n📊 Total: {len(leads)} | 📧 Emails Found: {em}", parse_mode='Markdown'
             )
         os.unlink(path)
