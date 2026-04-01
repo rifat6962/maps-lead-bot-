@@ -1,6 +1,4 @@
 import os, csv, asyncio, tempfile
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from threading import Thread
 from dotenv import load_dotenv
 from apify_client import ApifyClient
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -10,29 +8,15 @@ from telegram.ext import (
 )
 
 load_dotenv()
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TOKEN       = os.getenv("TELEGRAM_BOT_TOKEN")
 APIFY_TOKEN = os.getenv("APIFY_API_TOKEN")
+RENDER_URL  = os.getenv("RENDER_URL")          # তোমার Render URL
 
 LOCATION, KEYWORD, CONFIRM = range(3)
 store = {}
 
-# ── Render port fix ──────────────────────────────────
-class _H(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, *a): pass
-
-def start_http():
-    port = int(os.environ.get("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), _H).serve_forever()
-
-# ── Apify scraper ────────────────────────────────────
 def scrape(location, keyword):
     client = ApifyClient(APIFY_TOKEN)
-
-    # Actor: https://apify.com/apify/google-maps-scraper
     run = client.actor("compass/crawler-google-places").call(run_input={
         "searchStringsArray": [f"{keyword} in {location}"],
         "maxCrawledPlacesPerSearch": 50,
@@ -41,7 +25,6 @@ def scrape(location, keyword):
         "includeOpeningHours": False,
         "includePeopleAlsoSearchFor": False,
     })
-
     leads = []
     for item in client.dataset(run["defaultDatasetId"]).iterate_items():
         leads.append({
@@ -68,7 +51,6 @@ def to_csv(leads):
     tmp.close()
     return tmp.name
 
-# ── Bot handlers ─────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Google Maps Lead Bot*\n\nশুরু করতে /generate লেখো।",
@@ -116,15 +98,13 @@ async def confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"⏳ *Scraping চলছে...*\n📍 {loc} → 🔍 {kw}\n\n_৩–৫ মিনিট লাগতে পারে_",
         parse_mode='Markdown'
     )
-
     try:
         loop = asyncio.get_event_loop()
         leads = await loop.run_in_executor(None, scrape, loc, kw)
-
         if not leads:
             await ctx.bot.edit_message_text(
                 chat_id=q.message.chat_id, message_id=msg.message_id,
-                text="😔 কোনো result নেই। অন্য keyword/location দাও।"
+                text="😔 কোনো result নেই।"
             )
             return ConversationHandler.END
 
@@ -138,19 +118,16 @@ async def confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         with open(path, 'rb') as f:
             await ctx.bot.send_document(
-                chat_id=q.message.chat_id,
-                document=f,
+                chat_id=q.message.chat_id, document=f,
                 filename=f"leads_{loc}_{kw}.csv".replace(' ', '_'),
                 caption=(
                     f"🎯 *{loc}* — *{kw}*\n"
-                    f"📊 Total: *{len(leads)}*\n"
-                    f"📧 Email: *{em}* | 📞 Phone: *{ph}*\n\n"
+                    f"📊 Total: *{len(leads)}* | 📧 Email: *{em}* | 📞 Phone: *{ph}*\n\n"
                     f"নতুন search → /generate"
                 ),
                 parse_mode='Markdown'
             )
         os.unlink(path)
-
     except Exception as e:
         await ctx.bot.edit_message_text(
             chat_id=q.message.chat_id, message_id=msg.message_id,
@@ -162,11 +139,7 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ বাতিল।")
     return ConversationHandler.END
 
-# ── Main ─────────────────────────────────────────────
 def main():
-    # Port খোলো Render এর জন্য
-    Thread(target=start_http, daemon=True).start()
-
     app = Application.builder().token(TOKEN).build()
     conv = ConversationHandler(
         entry_points=[CommandHandler("generate", gen_start)],
@@ -181,9 +154,15 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv)
     print("✅ Bot চালু!")
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True
+
+    # Webhook mode — polling এর বদলে
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000)),
+        webhook_url=f"{RENDER_URL}/{TOKEN}",
+        secret_token="mysecret123",
+        url_path=TOKEN,
+        drop_pending_updates=True,
     )
 
 if __name__ == "__main__":
