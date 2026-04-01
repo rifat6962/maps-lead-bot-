@@ -19,48 +19,59 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # ══════════════════════════════════════════════
-#   1. PURE PYTHON GOOGLE MAPS LIBRARY
+#   1. PURE PYTHON GOOGLE MAPS LIBRARY (RESTORED)
 # ══════════════════════════════════════════════
-class GoogleMapsScraper:
-    def __init__(self):
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9"
-        }
+def get_headers():
+    HEADERS_LIST = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/118.0.0.0 Safari/537.36",
+    ]
+    return {
+        "User-Agent": random.choice(HEADERS_LIST),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Referer": "https://www.google.com/",
+    }
 
+class GoogleMapsScraper:
     def get_page(self, keyword, location, start):
         results = []
-        query = urllib.parse.quote(f"{keyword} in {location}")
-        url = f"https://www.google.com/search?q={query}&tbm=lcl&start={start}"
+        query = urllib.parse.quote_plus(f"{keyword} in {location}")
+        url = f"https://www.google.com/search?q={query}&tbm=lcl&start={start}&num=20&hl=en"
         
         try:
-            res = requests.get(url, headers=self.headers, timeout=15)
+            res = requests.get(url, headers=get_headers(), timeout=15)
             soup = BeautifulSoup(res.text, 'html.parser')
             
-            places = soup.find_all('div', class_=['VkpGBb', 'rllt__details', 'dbg0pd'])
-            if not places: return []
+            # Restored the powerful exact selectors from your original code
+            blocks = soup.select('div.VkpGBb, div.rllt__details, div[jscontroller]')
+            if not blocks:
+                blocks = soup.select('div.uMdZh, div.cXedhc')
                 
-            for place in places:
-                name_tag = place.find(['div', 'h3', 'span'], class_='dbg0pd') or place.find('div', role='heading')
-                name = name_tag.get_text(strip=True) if name_tag else "N/A"
+            if not blocks: return []
+                
+            for block in blocks:
+                text_content = block.get_text(separator=' ', strip=True)
+                
+                name_el = block.select_one('div[role="heading"], .dbg0pd, span.OSrXXb')
+                name = name_el.get_text(strip=True) if name_el else "N/A"
                 
                 if name == "N/A" or len(name) < 3: continue
                     
-                text_content = place.get_text(separator=' ', strip=True)
-                
                 rating_match = re.search(r'(\d[\.,]\d)\s*(?:\(|stars|reviews)', text_content)
                 rating = rating_match.group(1).replace(',', '.') if rating_match else "N/A"
                 
                 phone_match = re.search(r'(\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}', text_content)
-                phone = phone_match.group(0) if phone_match else "N/A"
+                phone = phone_match.group(0).strip() if phone_match else "N/A"
                 
                 website = "N/A"
-                for a in place.find_all('a', href=True):
+                for a in block.select('a[href]'):
                     href = a['href']
-                    if '/url?q=' in href and 'google.com' not in href:
+                    if '/url?q=' in href and 'google' not in href.lower():
                         website = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
                         break
-                    elif href.startswith('http') and 'google.com' not in href:
+                    elif href.startswith('http') and 'google' not in href.lower():
                         website = href
                         break
                         
@@ -83,23 +94,22 @@ class GoogleMapsScraper:
 # ══════════════════════════════════════════════
 class DeepEmailExtractor:
     def __init__(self):
-        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         self.email_regex = r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
 
     def get_email(self, url):
         if not url or url == "N/A": return "N/A"
         if not url.startswith('http'): url = 'http://' + url
         try:
-            r = requests.get(url, headers=self.headers, timeout=8, verify=False)
+            r = requests.get(url, headers=get_headers(), timeout=8, verify=False)
             emails = list(set(re.findall(self.email_regex, r.text)))
             valid = [e for e in emails if not any(x in e.lower() for x in ['example','domain','sentry','@2x','.png','.jpg','wixpress'])]
             if valid: return valid[0]
             
             soup = BeautifulSoup(r.text, 'html.parser')
-            for a in soup.find_all('a', href=True):
+            for a in soup.select('a[href]'):
                 if 'contact' in a.get('href', '').lower():
                     clink = urllib.parse.urljoin(url, a['href'])
-                    r2 = requests.get(clink, headers=self.headers, timeout=8, verify=False)
+                    r2 = requests.get(clink, headers=get_headers(), timeout=8, verify=False)
                     emails2 = list(set(re.findall(self.email_regex, r2.text)))
                     valid2 = [e for e in emails2 if not any(x in e.lower() for x in ['example','domain','sentry','@2x','.png','.jpg'])]
                     if valid2: return valid2[0]
@@ -176,8 +186,11 @@ def run_job_thread(job_id, data):
         
         jobs[job_id] = {'status': 'scraping', 'count': 0, 'status_text': 'Starting engine...'}
         
+        kw_attempts = 0
+        max_kw_attempts = 15 # Prevent infinite loops if location is completely empty
+        
         # --- PHASE 1: SCRAPING (Target Guarantee) ---
-        while len(final_leads) < max_leads:
+        while len(final_leads) < max_leads and kw_attempts < max_kw_attempts:
             if not pending_keywords:
                 jobs[job_id]['status_text'] = f"Generating new keywords for '{base_keyword}'..."
                 new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
@@ -185,6 +198,7 @@ def run_job_thread(job_id, data):
                 
             current_kw = pending_keywords.pop(0)
             used_keywords.add(current_kw.lower())
+            kw_attempts += 1
             
             jobs[job_id]['status_text'] = f"Scraping keyword: '{current_kw}'..."
             start = 0
@@ -203,21 +217,23 @@ def run_job_thread(job_id, data):
                     if len(final_leads) >= max_leads: break
                     if lead['Name'] in seen_names: continue
                     
+                    # Rating Filter
                     if max_rating and lead['Rating'] != "N/A":
                         try:
                             if float(lead['Rating']) > float(max_rating): continue
                         except: continue
                     
+                    # Strict Email Check
                     if lead['Website'] == 'N/A': continue
                     email = email_lib.get_email(lead['Website'])
-                    if email == "N/A": continue # Strict Valid Email check
+                    if email == "N/A": continue 
                     
                     lead['Email'] = email
                     seen_names.add(lead['Name'])
                     final_leads.append(lead)
                     
                     jobs[job_id]['count'] = len(final_leads)
-                    jobs[job_id]['leads'] = final_leads # Save for UI preview
+                    jobs[job_id]['leads'] = final_leads # Update live
                     jobs[job_id]['status_text'] = f"Found {len(final_leads)}/{max_leads} valid emails... (Searching: {current_kw})"
                         
                 start += 20
@@ -562,41 +578,56 @@ async function startJob(){
     webhook_url: webhook, templates: templates
   };
 
-  const r = await fetch('/api/scrape',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-  const d = await r.json();
-  if(d.error){ setSt(d.error,'err'); document.getElementById('btn-run').disabled=false; return; }
-  jid = d.job_id;
+  try {
+      const r = await fetch('/api/scrape',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      const d = await r.json();
+      if(d.error){ setSt(d.error,'err'); document.getElementById('btn-run').disabled=false; return; }
+      jid = d.job_id;
 
-  historyData.unshift({loc: loc, kw: kw, target: count, date: new Date().toLocaleString()});
-  localStorage.setItem('history', JSON.stringify(historyData)); renderHistory();
+      historyData.unshift({loc: loc, kw: kw, target: count, date: new Date().toLocaleString()});
+      localStorage.setItem('history', JSON.stringify(historyData)); renderHistory();
 
-  const poll = async()=>{
-    const r2 = await fetch('/api/status/'+jid); const d2 = await r2.json();
-    
-    if(d2.status==='scraping'){
-        setSt(d2.status_text, 'load', Math.max(5, (d2.count/count)*100));
-        setTimeout(poll, 3000);
-    }
-    else if(d2.status==='sending_emails'){
-        if(!tableShown && d2.leads) {
-            updStats(d2.leads); showPV(d2.leads); tableShown = true;
-            document.getElementById('dlbtn').classList.remove('hidden');
+      const poll = async()=>{
+        try {
+            const r2 = await fetch('/api/status/'+jid); 
+            const d2 = await r2.json();
+            
+            if(d2.status==='scraping'){
+                setSt(d2.status_text, 'load', Math.max(5, (d2.count/count)*100));
+                setTimeout(poll, 3000);
+            }
+            else if(d2.status==='sending_emails'){
+                if(!tableShown && d2.leads) {
+                    updStats(d2.leads); showPV(d2.leads); tableShown = true;
+                    document.getElementById('dlbtn').classList.remove('hidden');
+                }
+                let emailPct = (d2.emails_sent / d2.total_to_send) * 100;
+                setSt(d2.status_text, 'email', Math.max(5, emailPct));
+                setTimeout(poll, 3000);
+            }
+            else if(d2.status==='done'){
+              document.getElementById('btn-run').disabled=false;
+              if(!tableShown && d2.leads) { updStats(d2.leads); showPV(d2.leads); }
+              setSt(d2.status_text, 'done', 100);
+              document.getElementById('dlbtn').classList.remove('hidden');
+            } 
+            else if(d2.status==='error'){
+              document.getElementById('btn-run').disabled=false;
+              setSt(d2.error, 'err');
+            }
+            else {
+              // CRITICAL FIX: Keep polling if status is not found or delayed
+              setTimeout(poll, 3000);
+            }
+        } catch(e) {
+            setTimeout(poll, 3000); // Keep trying if network fails briefly
         }
-        let emailPct = (d2.emails_sent / d2.total_to_send) * 100;
-        setSt(d2.status_text, 'email', Math.max(5, emailPct));
-        setTimeout(poll, 3000);
-    }
-    else if(d2.status==='done'){
+      };
+      setTimeout(poll, 2000);
+  } catch(e) {
+      setSt('Failed to connect to server.','err');
       document.getElementById('btn-run').disabled=false;
-      if(!tableShown && d2.leads) { updStats(d2.leads); showPV(d2.leads); }
-      setSt(d2.status_text, 'done', 100);
-      document.getElementById('dlbtn').classList.remove('hidden');
-    } else if(d2.status==='error'){
-      document.getElementById('btn-run').disabled=false;
-      setSt(d2.error, 'err');
-    }
-  };
-  setTimeout(poll, 2000);
+  }
 }
 
 function doDL(){ if(jid) window.location='/api/download/'+jid; }
@@ -622,7 +653,7 @@ def status(job_id):
     job = jobs.get(job_id, {'status': 'not_found'})
     out = dict(job)
     # Send leads to UI for preview if scraping is done or emails are sending
-    if out.get('status') in ['sending_emails', 'done']:
+    if out.get('status') in ['sending_emails', 'done', 'scraping']:
         out['leads'] = job.get('leads', [])
     return jsonify(out)
 
@@ -697,15 +728,9 @@ async def m_rating(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def background_bot_task(chat_id, message_id, data, bot):
     try:
-        # Run the scraper loop without email automation parts for the bot
         loop = asyncio.get_event_loop()
-        # We pass empty webhook/templates so it only does Phase 1
-        job_id = f"bot_{int(time.time())}"
-        jobs[job_id] = {}
-        
         await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="⏳ *Scraping & Deep Email Extraction running...*\n_AI will auto-expand keywords until target is reached._", parse_mode='Markdown')
         
-        # Manually calling the logic to return leads directly
         maps_lib = GoogleMapsScraper()
         email_lib = DeepEmailExtractor()
         final_leads = []
@@ -713,14 +738,16 @@ async def background_bot_task(chat_id, message_id, data, bot):
         used_keywords = set()
         pending_keywords = [data['kw']]
         max_leads = data['count']
+        kw_attempts = 0
         
-        while len(final_leads) < max_leads:
+        while len(final_leads) < max_leads and kw_attempts < 15:
             if not pending_keywords:
                 new_kws = generate_ai_keywords(data['kw'], data['loc'], used_keywords)
                 pending_keywords.extend(new_kws)
                 
             current_kw = pending_keywords.pop(0)
             used_keywords.add(current_kw.lower())
+            kw_attempts += 1
             
             start = 0
             empty_strikes = 0
@@ -772,8 +799,6 @@ async def execute_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = bot_store.get(uid)
     
     msg = await q.edit_message_text("⏳ *Initializing background task...*", parse_mode='Markdown')
-    
-    # Run in background to not block bot
     asyncio.create_task(background_bot_task(q.message.chat_id, msg.message_id, data, ctx.bot))
 
 def run_telegram_bot():
