@@ -6,3 +6,4 @@ groq
 Flask
 python-telegram-bot
 duckduckgo-search
+playwright
