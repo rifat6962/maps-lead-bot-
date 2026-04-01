@@ -1,6 +1,7 @@
 import os, csv, asyncio, tempfile, threading, io, uuid, re, time, json, urllib.parse, random
 import requests
 import concurrent.futures
+import urllib3
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from groq import Groq
@@ -11,6 +12,8 @@ from telegram.ext import (
     filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 )
 
+# Suppress SSL warnings for cleaner logs and slightly faster requests
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
 # ==========================================
@@ -98,7 +101,7 @@ class GoogleMapsScraper:
 class DeepEmailExtractor:
     def __init__(self):
         self.email_regex = r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
-        self.bad_keywords = ['example', 'domain', 'sentry', '@2x', '.png', '.jpg', '.jpeg', '.gif', 'wixpress', 'bootstrap']
+        self.bad_keywords = ['example', 'domain', 'sentry', '@2x', '.png', '.jpg', '.jpeg', '.gif', 'wixpress', 'bootstrap', 'rating']
 
     def is_valid_email(self, email):
         email = email.lower()
@@ -109,11 +112,10 @@ class DeepEmailExtractor:
         if not url.startswith('http'): url = 'http://' + url
         
         visited_urls = set()
-        urls_to_visit = [url]
         
         try:
             # Step 1: Check Homepage
-            r = requests.get(url, headers=get_headers(), timeout=8, verify=False)
+            r = requests.get(url, headers=get_headers(), timeout=6, verify=False)
             visited_urls.add(url)
             
             emails = list(set(re.findall(self.email_regex, r.text)))
@@ -133,7 +135,7 @@ class DeepEmailExtractor:
             # Step 3: Visit up to 3 internal pages to find email
             for link in list(set(internal_links))[:3]:
                 try:
-                    r2 = requests.get(link, headers=get_headers(), timeout=8, verify=False)
+                    r2 = requests.get(link, headers=get_headers(), timeout=6, verify=False)
                     visited_urls.add(link)
                     emails2 = list(set(re.findall(self.email_regex, r2.text)))
                     valid_emails2 = [e for e in emails2 if self.is_valid_email(e)]
@@ -148,11 +150,12 @@ class DeepEmailExtractor:
 #   3. AI KEYWORD GENERATOR & PERSONALIZER
 # ══════════════════════════════════════════════
 def generate_ai_keywords(base_kw, location, used_kws):
-    fallback = [f"best {base_kw}", f"top {base_kw}", f"{base_kw} services", f"affordable {base_kw}", f"{base_kw} agency", f"{base_kw} near me"]
+    fallback = [f"best {base_kw}", f"top {base_kw}", f"{base_kw} services", f"affordable {base_kw}", f"{base_kw} agency", f"{base_kw} near me", f"{base_kw} company", f"{base_kw} experts"]
     if not GROQ_API_KEY: return fallback
     try:
         client = Groq(api_key=GROQ_API_KEY)
-        prompt = f"I am searching for '{base_kw}' in '{location}'. Used keywords: {list(used_kws)}. Generate 10 NEW, highly related search terms/categories. Return ONLY a comma-separated list."
+        # Asking for 30 keywords at a time to ensure we have a massive pool to search from
+        prompt = f"I am searching for '{base_kw}' in '{location}'. Used keywords: {list(used_kws)}. Generate 30 NEW, highly related search terms/categories. Return ONLY a comma-separated list."
         res = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama3-8b-8192",
@@ -207,31 +210,36 @@ def run_job_thread(job_id, data):
         maps_scraper = GoogleMapsScraper()
         email_lib = DeepEmailExtractor()
         
-        jobs[job_id] = {'status': 'scraping', 'count': 0, 'leads': [], 'status_text': 'Starting Fast Engine...'}
+        jobs[job_id] = {'status': 'scraping', 'count': 0, 'leads': [], 'status_text': 'Starting AI Keyword Generation...'}
         
         seen_names = set()
         used_keywords = set()
         pending_keywords = [base_keyword]
-        kw_attempts = 0
-        max_kw_attempts = 15
         
-        # --- PHASE 1: STRICT SCRAPING (ONLY VALID EMAILS) ---
-        while len(jobs[job_id]['leads']) < max_leads and kw_attempts < max_kw_attempts:
+        # --- PHASE 1: STRICT SCRAPING (UNTIL TARGET HIT) ---
+        # The loop will continue running until len(leads) == max_leads
+        while len(jobs[job_id]['leads']) < max_leads:
+            
+            # If we run out of keywords, generate 30 more!
             if not pending_keywords:
-                jobs[job_id]['status_text'] = f"Generating new keywords for '{base_keyword}'..."
+                jobs[job_id]['status_text'] = f"Generating 30+ new keywords for '{base_keyword}'..."
                 new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
                 pending_keywords.extend(new_kws)
                 
             current_kw = pending_keywords.pop(0)
             used_keywords.add(current_kw.lower())
-            kw_attempts += 1
             
-            jobs[job_id]['status_text'] = f"Fetching results for: {current_kw}..."
+            jobs[job_id]['status_text'] = f"Searching Google Maps for: {current_kw}..."
             raw_leads = maps_scraper.fetch_batch(current_kw, location)
             
+            if not raw_leads:
+                continue # If no results for this keyword, immediately try the next one
+            
+            # Process the leads found for this keyword one by one
             for lead in raw_leads:
+                # TARGET HIT CHECK: Stop immediately if we reached the goal
                 if len(jobs[job_id]['leads']) >= max_leads:
-                    break # Target Hit! Stop immediately.
+                    break 
                     
                 if lead['Name'] in seen_names:
                     continue
@@ -247,18 +255,20 @@ def run_job_thread(job_id, data):
                     
                 jobs[job_id]['status_text'] = f"Deep searching email for: {lead['Name']}..."
                 
-                # Extract Email (Deep Search)
+                # Extract Email (Deep Search inside the website)
                 extracted_email = email_lib.get_email(lead['Website'])
                 
-                # STRICT MODE: If no email found, DISCARD the lead.
+                # STRICT MODE: If no email found, DISCARD the lead and move to the next.
                 if extracted_email == "N/A":
                     continue 
                     
+                # SUCCESS! Email found. Add to our final list.
                 lead['Email'] = extracted_email
                 seen_names.add(lead['Name'])
                 jobs[job_id]['leads'].append(lead)
                 jobs[job_id]['count'] = len(jobs[job_id]['leads'])
-                jobs[job_id]['status_text'] = f"Found {jobs[job_id]['count']}/{max_leads} valid emails... (Latest: {lead['Email']})"
+                
+                jobs[job_id]['status_text'] = f"🎯 Found {jobs[job_id]['count']}/{max_leads} valid emails! (Latest: {lead['Email']})"
                 
             time.sleep(1)
             
@@ -764,17 +774,15 @@ def run_bot_scrape_fast(data):
     seen_names = set()
     used_keywords = set()
     pending_keywords = [base_keyword]
-    kw_attempts = 0
     final_leads = []
     
-    while len(final_leads) < max_leads and kw_attempts < 15:
+    while len(final_leads) < max_leads:
         if not pending_keywords:
             new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
             pending_keywords.extend(new_kws)
             
         current_kw = pending_keywords.pop(0)
         used_keywords.add(current_kw.lower())
-        kw_attempts += 1
         
         raw_leads = maps_scraper.fetch_batch(current_kw, location)
         
