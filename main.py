@@ -11,16 +11,33 @@ from telegram.ext import (
     filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 )
 
-# Disable SSL Warnings for aggressive scraping
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
-CONFIG = {
-    "TELEGRAM_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN")
-}
+# ══════════════════════════════════════════════
+#   PERSISTENT SETTINGS (Fixes AI Chat API Error)
+# ══════════════════════════════════════════════
+SETTINGS_FILE = "settings.json"
+
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                return json.load(f).get("GROQ_API_KEY", "")
+        except:
+            pass
+    return os.getenv("GROQ_API_KEY", "")
+
+def save_settings(key):
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump({"GROQ_API_KEY": key}, f)
+    global GROQ_API_KEY
+    GROQ_API_KEY = key
+
+GROQ_API_KEY = load_settings()
 
 # ══════════════════════════════════════════════
-#   1. PURE PYTHON GOOGLE MAPS LIBRARY (AGGRESSIVE)
+#   1. SUPERCHARGED GOOGLE MAPS LIBRARY (tbm=lcl)
 # ══════════════════════════════════════════════
 class GoogleMapsScraper:
     def __init__(self):
@@ -32,37 +49,39 @@ class GoogleMapsScraper:
     def search(self, keyword, location, max_results=100, max_rating=None):
         results = []
         seen_names = set()
+        seen_domains = set()
         
-        # Query Variations to force Google to give MORE leads
+        # Smart Variations to bypass Google's 60-result limit
         queries = [
             f"{keyword} in {location}",
             f"best {keyword} in {location}",
             f"top {keyword} in {location}",
-            f"{keyword} near {location}",
-            f"{keyword} companies in {location}"
+            f"local {keyword} in {location}",
+            f"{keyword} services in {location}",
+            f"{keyword} near {location}"
         ]
         
         for q in queries:
             if len(results) >= int(max_results): break
-            
             query_encoded = urllib.parse.quote(q)
-            # Fetch up to 5 pages (100 results) per variation
+            
+            # Fetch up to 5 pages per variation
             for start in range(0, 100, 20):
                 if len(results) >= int(max_results): break
                 
                 url = f"https://www.google.com/search?q={query_encoded}&tbm=lcl&start={start}"
                 try:
-                    res = requests.get(url, headers=self.headers, timeout=15)
+                    res = requests.get(url, headers=self.headers, timeout=10)
                     soup = BeautifulSoup(res.text, 'html.parser')
                     places = soup.find_all('div', class_=['VkpGBb', 'rllt__details', 'dbg0pd'])
                     
-                    if not places: break # No more results for this variation
+                    if not places: break # End of pagination for this query
                         
                     for place in places:
                         name_tag = place.find(['div', 'h3', 'span'], class_='dbg0pd') or place.find('div', role='heading')
                         name = name_tag.get_text(strip=True) if name_tag else "N/A"
                         
-                        if name == "N/A" or name in seen_names or len(name) < 3:
+                        if name == "N/A" or name.lower() in seen_names or len(name) < 3:
                             continue
                             
                         text_content = place.get_text(separator=' ', strip=True)
@@ -85,8 +104,14 @@ class GoogleMapsScraper:
                             elif href.startswith('http') and 'google.com' not in href:
                                 website = href
                                 break
+                        
+                        # Deduplication logic
+                        if website != "N/A":
+                            domain = urllib.parse.urlparse(website).netloc.replace('www.', '')
+                            if domain in seen_domains: continue
+                            seen_domains.add(domain)
                                 
-                        seen_names.add(name)
+                        seen_names.add(name.lower())
                         results.append({
                             "Name": name,
                             "Phone": phone,
@@ -97,14 +122,37 @@ class GoogleMapsScraper:
                             "Maps_Link": f"https://www.google.com/maps/search/{urllib.parse.quote(name + ' ' + location)}"
                         })
                         
-                        if len(results) >= int(max_results):
-                            return results
-                            
+                        if len(results) >= int(max_results): return results
                 except Exception as e:
-                    print(f"Library Error: {e}")
+                    print(f"Maps Scraper Error: {e}")
                     break
-                time.sleep(1) # Anti-block delay
+                time.sleep(0.5) # Anti-block delay
                 
+        # ORGANIC FALLBACK: If target still not met, scrape normal Google search
+        if len(results) < int(max_results):
+            try:
+                g_url = f"https://www.google.com/search?q={urllib.parse.quote(keyword + ' in ' + location)}&num=50"
+                g_res = requests.get(g_url, headers=self.headers, timeout=10)
+                soup = BeautifulSoup(g_res.text, 'html.parser')
+                
+                for a in soup.find_all('a', href=True):
+                    link = a['href']
+                    if link.startswith('/url?q='): link = urllib.parse.unquote(link.split('/url?q=')[1].split('&')[0])
+                    
+                    if link.startswith('http') and not any(x in link.lower() for x in ['google', 'facebook', 'yelp', 'yellowpages', 'tripadvisor', 'instagram', 'linkedin', 'directory']):
+                        domain = urllib.parse.urlparse(link).netloc.replace('www.', '')
+                        if domain not in seen_domains:
+                            name = domain.split('.')[0].replace('-', ' ').title()
+                            seen_domains.add(domain)
+                            results.append({
+                                "Name": name, "Phone": "N/A", "Website": link,
+                                "Rating": "N/A", "Address": location, "Category": keyword,
+                                "Maps_Link": "N/A"
+                            })
+                            if len(results) >= int(max_results): break
+            except Exception as e:
+                print(f"Organic Scraper Error: {e}")
+
         return results
 
 # ══════════════════════════════════════════════
@@ -131,29 +179,25 @@ class DeepEmailExtractor:
         if not url or url == "N/A": return "N/A"
         if not url.startswith('http'): url = 'http://' + url
         
-        # Check homepage, contact page, and about page
         paths_to_check = ['', '/contact', '/contact-us', '/about', '/about-us']
         
         for path in paths_to_check:
             target_url = urllib.parse.urljoin(url, path)
             try:
-                r = requests.get(target_url, headers=self.headers, timeout=10, verify=False)
+                r = requests.get(target_url, headers=self.headers, timeout=8, verify=False)
                 
-                # 1. Check mailto: links first (most accurate)
+                # Check mailto links first
                 soup = BeautifulSoup(r.text, 'html.parser')
                 for a in soup.find_all('a', href=True):
                     if a['href'].startswith('mailto:'):
                         email = a['href'].replace('mailto:', '').split('?')[0].strip()
-                        if '@' in email and '.' in email:
-                            return email
+                        if '@' in email and '.' in email: return email
                             
-                # 2. Check raw HTML text
+                # Check raw HTML
                 found_emails = self.extract_from_html(r.text)
-                if found_emails:
-                    return found_emails[0]
+                if found_emails: return found_emails[0]
             except:
                 continue
-                
         return "N/A"
 
 # ══════════════════════════════════════════════
@@ -172,6 +216,7 @@ def run_full_scraper(location, keyword, max_leads=100, max_rating=None):
         else:
             lead['Email'] = "N/A"
             
+        # Quality Check: Keep only if it has Phone or Email or Website
         if lead['Phone'] != 'N/A' or lead['Email'] != 'N/A' or lead['Website'] != 'N/A':
             final_leads.append(lead)
             
@@ -180,7 +225,8 @@ def run_full_scraper(location, keyword, max_leads=100, max_rating=None):
 # ══════════════════════════════════════════════
 #   GROQ AI BRAIN
 # ══════════════════════════════════════════════
-def parse_with_ai(user_text, api_key):
+def parse_with_ai(user_text, provided_key=None):
+    api_key = provided_key or GROQ_API_KEY
     if not api_key:
         raise Exception("Groq API Key is missing! Please add it in settings.")
     
@@ -209,7 +255,7 @@ def parse_with_ai(user_text, api_key):
         if json_match: return json.loads(json_match.group(0))
         return json.loads(response)
     except Exception as e:
-        raise Exception("Failed to connect to Groq AI. Check your API Key.")
+        raise Exception("Failed to connect to Groq AI. Please check your API Key.")
 
 # ══════════════════════════════════════════════
 #   WEB DASHBOARD (FLASK + DARK TAILWIND CSS)
@@ -223,7 +269,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pro Lead Gen Agent (Python Library Edition)</title>
+    <title>Pro Lead Gen Agent</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <script>
@@ -255,7 +301,7 @@ HTML_TEMPLATE = """
                 <div class="bg-gradient-to-br from-indigo-500 to-purple-600 text-white p-3 rounded-xl shadow-lg"><i class="fa-solid fa-map-location-dot text-2xl"></i></div>
                 <div>
                     <h1 class="text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-purple-400">LeadGen Pro</h1>
-                    <span class="text-xs font-bold bg-green-500 text-white px-2 py-1 rounded-full">Aggressive Python Engine (100% Free)</span>
+                    <span class="text-xs font-bold bg-green-500 text-white px-2 py-1 rounded-full">Supercharged Python Engine (Free)</span>
                 </div>
             </div>
             <button onclick="switchTab('settings')" class="text-gray-400 hover:text-white transition bg-gray-800 p-3 rounded-xl border border-gray-700"><i class="fa-solid fa-gear text-xl"></i></button>
@@ -351,7 +397,11 @@ HTML_TEMPLATE = """
         function saveSettings() {
             const groq = document.getElementById('groq-key').value;
             localStorage.setItem('groq_key', groq);
-            alert('Settings Saved Successfully! It will now work perfectly.');
+            fetch('/api/settings', { 
+                method: 'POST', 
+                headers: {'Content-Type':'application/json'}, 
+                body: JSON.stringify({groq: groq}) 
+            }).then(() => alert('Settings Saved Successfully! It will now work perfectly.'));
         }
 
         function showStatus(msg, isSpin=true, isError=false) {
@@ -371,7 +421,7 @@ HTML_TEMPLATE = """
         }
 
         async function startJob(payload) {
-            showStatus('Running Aggressive Python Engine (Extracting Data & Emails)...');
+            showStatus('Running Supercharged Python Engine (Extracting Data & Emails)...');
             const res = await fetch('/api/scrape', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
             const data = await res.json();
             if(data.error) return showStatus(data.error, false, true);
@@ -489,6 +539,11 @@ HTML_TEMPLATE = """
 @flask_app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
+
+@flask_app.route('/api/settings', methods=['POST'])
+def update_settings():
+    if request.json.get('groq'): save_settings(request.json.get('groq'))
+    return jsonify({"success": True})
 
 @flask_app.route('/api/chat', methods=['POST'])
 def handle_chat():
