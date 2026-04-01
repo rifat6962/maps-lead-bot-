@@ -33,7 +33,7 @@ def get_headers():
     }
 
 # ══════════════════════════════════════════════
-#   1. SUPER FAST PURE PYTHON SCRAPER (NO BROWSER NEEDED)
+#   1. SUPER FAST PURE PYTHON SCRAPER
 # ══════════════════════════════════════════════
 class GoogleMapsScraper:
     def fetch_batch(self, keyword, location):
@@ -59,7 +59,6 @@ class GoogleMapsScraper:
                     rating_match = re.search(r'(\d[\.,]\d)\s*[\(\d]', text_content)
                     rating = rating_match.group(1).replace(',', '.') if rating_match else "N/A"
                     
-                    # Improved Phone Regex
                     ph = re.search(r'(\+?\d{1,3}[\s\-\(\)]?\d{3,4}[\s\-\(\)]?\d{3,4}[\s\-\(\)]?\d{3,4})', text_content)
                     phone = ph.group(0).strip() if ph else "N/A"
                     
@@ -86,7 +85,6 @@ class GoogleMapsScraper:
             except Exception:
                 return []
 
-        # Fetch 5 pages (100 results) at the exact same time using Multi-threading
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             results = executor.map(get_offset, [0, 20, 40, 60, 80])
             for res in results:
@@ -95,29 +93,54 @@ class GoogleMapsScraper:
         return all_leads
 
 # ══════════════════════════════════════════════
-#   2. DEEP EMAIL EXTRACTOR LIBRARY
+#   2. DEEP EMAIL EXTRACTOR (TONNO TONNO KORE KHOJA)
 # ══════════════════════════════════════════════
 class DeepEmailExtractor:
     def __init__(self):
         self.email_regex = r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+        self.bad_keywords = ['example', 'domain', 'sentry', '@2x', '.png', '.jpg', '.jpeg', '.gif', 'wixpress', 'bootstrap']
+
+    def is_valid_email(self, email):
+        email = email.lower()
+        return not any(bad in email for bad in self.bad_keywords)
 
     def get_email(self, url):
         if not url or url == "N/A": return "N/A"
         if not url.startswith('http'): url = 'http://' + url
+        
+        visited_urls = set()
+        urls_to_visit = [url]
+        
         try:
-            r = requests.get(url, headers=get_headers(), timeout=5, verify=False)
-            emails = list(set(re.findall(self.email_regex, r.text)))
-            valid = [e for e in emails if not any(x in e.lower() for x in ['example','domain','sentry','@2x','.png','.jpg','wixpress'])]
-            if valid: return valid[0]
+            # Step 1: Check Homepage
+            r = requests.get(url, headers=get_headers(), timeout=8, verify=False)
+            visited_urls.add(url)
             
+            emails = list(set(re.findall(self.email_regex, r.text)))
+            valid_emails = [e for e in emails if self.is_valid_email(e)]
+            if valid_emails: return valid_emails[0]
+            
+            # Step 2: Find Internal Links (Contact, About, Support)
             soup = BeautifulSoup(r.text, 'html.parser')
+            internal_links = []
             for a in soup.select('a[href]'):
-                if 'contact' in a.get('href', '').lower():
-                    clink = urllib.parse.urljoin(url, a['href'])
-                    r2 = requests.get(clink, headers=get_headers(), timeout=5, verify=False)
+                href = a.get('href', '').lower()
+                if any(kw in href for kw in ['contact', 'about', 'support', 'help']):
+                    full_link = urllib.parse.urljoin(url, a['href'])
+                    if full_link not in visited_urls and full_link.startswith('http'):
+                        internal_links.append(full_link)
+            
+            # Step 3: Visit up to 3 internal pages to find email
+            for link in list(set(internal_links))[:3]:
+                try:
+                    r2 = requests.get(link, headers=get_headers(), timeout=8, verify=False)
+                    visited_urls.add(link)
                     emails2 = list(set(re.findall(self.email_regex, r2.text)))
-                    valid2 = [e for e in emails2 if not any(x in e.lower() for x in ['example','domain','sentry','@2x','.png','.jpg'])]
-                    if valid2: return valid2[0]
+                    valid_emails2 = [e for e in emails2 if self.is_valid_email(e)]
+                    if valid_emails2: return valid_emails2[0]
+                except:
+                    continue
+                    
         except: pass
         return "N/A"
 
@@ -190,9 +213,9 @@ def run_job_thread(job_id, data):
         used_keywords = set()
         pending_keywords = [base_keyword]
         kw_attempts = 0
-        max_kw_attempts = 10
+        max_kw_attempts = 15
         
-        # --- PHASE 1: FAST SCRAPING ---
+        # --- PHASE 1: STRICT SCRAPING (ONLY VALID EMAILS) ---
         while len(jobs[job_id]['leads']) < max_leads and kw_attempts < max_kw_attempts:
             if not pending_keywords:
                 jobs[job_id]['status_text'] = f"Generating new keywords for '{base_keyword}'..."
@@ -203,12 +226,12 @@ def run_job_thread(job_id, data):
             used_keywords.add(current_kw.lower())
             kw_attempts += 1
             
-            jobs[job_id]['status_text'] = f"Fast fetching 100+ results for: {current_kw}..."
+            jobs[job_id]['status_text'] = f"Fetching results for: {current_kw}..."
             raw_leads = maps_scraper.fetch_batch(current_kw, location)
             
             for lead in raw_leads:
                 if len(jobs[job_id]['leads']) >= max_leads:
-                    break
+                    break # Target Hit! Stop immediately.
                     
                 if lead['Name'] in seen_names:
                     continue
@@ -219,29 +242,35 @@ def run_job_thread(job_id, data):
                         if float(lead['Rating']) > float(max_rating): continue
                     except: pass
 
-                jobs[job_id]['status_text'] = f"Extracting email for: {lead['Name']}..."
+                if lead['Website'] == "N/A":
+                    continue # Skip if no website to find email
+                    
+                jobs[job_id]['status_text'] = f"Deep searching email for: {lead['Name']}..."
                 
-                # Extract Email (Non-blocking, saves even if N/A)
-                lead['Email'] = email_lib.get_email(lead['Website'])
+                # Extract Email (Deep Search)
+                extracted_email = email_lib.get_email(lead['Website'])
                 
+                # STRICT MODE: If no email found, DISCARD the lead.
+                if extracted_email == "N/A":
+                    continue 
+                    
+                lead['Email'] = extracted_email
                 seen_names.add(lead['Name'])
                 jobs[job_id]['leads'].append(lead)
                 jobs[job_id]['count'] = len(jobs[job_id]['leads'])
-                jobs[job_id]['status_text'] = f"Found {len(jobs[job_id]['leads'])}/{max_leads} leads... (Latest: {lead['Name']})"
+                jobs[job_id]['status_text'] = f"Found {jobs[job_id]['count']}/{max_leads} valid emails... (Latest: {lead['Email']})"
                 
-            time.sleep(1) # Small delay between keyword searches
+            time.sleep(1)
             
         final_leads = jobs[job_id]['leads']
         
-        # --- PHASE 2: AUTOMATED EMAIL SENDING ---
+        # --- PHASE 2: AUTOMATED EMAIL SENDING (1-2 Min Delay) ---
         if webhook_url and templates and len(final_leads) > 0:
             jobs[job_id]['status'] = 'sending_emails'
-            jobs[job_id]['total_to_send'] = len([l for l in final_leads if l['Email'] != 'N/A'])
+            jobs[job_id]['total_to_send'] = len(final_leads)
             emails_sent = 0
             
             for lead in final_leads:
-                if lead['Email'] == 'N/A': continue
-                
                 jobs[job_id]['status_text'] = f"Sending personalized email {emails_sent+1}/{jobs[job_id]['total_to_send']} to {lead['Email']}..."
                 
                 template = random.choice(templates)
@@ -255,10 +284,11 @@ def run_job_thread(job_id, data):
                 except Exception as e:
                     print(f"Failed to send email to {lead['Email']}: {e}")
                 
+                # 1 to 2 minutes delay between emails (60 to 120 seconds)
                 if emails_sent < jobs[job_id]['total_to_send']:
                     delay = random.randint(60, 120)
                     for i in range(delay, 0, -1):
-                        jobs[job_id]['status_text'] = f"Anti-Spam: Waiting {i}s before next email..."
+                        jobs[job_id]['status_text'] = f"Anti-Spam: Waiting {i}s before sending next email..."
                         time.sleep(1)
         
         # --- FINISHED ---
@@ -329,7 +359,7 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
 
   <!-- STATS -->
   <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
-    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-white" id="st">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-users text-indigo-400 text-xs"></i>Total Leads</div></div>
+    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-white" id="st">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-users text-indigo-400 text-xs"></i>Valid Leads</div></div>
     <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-emerald-400" id="se">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-envelope text-emerald-400 text-xs"></i>Emails Found</div></div>
     <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-sky-400" id="sp">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-phone text-sky-400 text-xs"></i>Phones</div></div>
     <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-violet-400" id="sw">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-globe text-violet-400 text-xs"></i>Websites</div></div>
@@ -357,7 +387,7 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
         <div><label class="text-xs text-slate-500 mb-1.5 block">⭐ Max Rating (Optional - For Bad Reviews)</label><input id="m-rating" type="number" step="0.1" class="inp" placeholder="e.g. 3.5"></div>
       </div>
       <div class="p-3 mb-4 rounded-xl text-xs" style="background:rgba(239,68,68,0.07);border:1px solid rgba(239,68,68,0.2);color:#f87171">
-        <i class="fa-solid fa-bolt mr-1"></i> <b>Fast Mode:</b> Extracts all leads instantly. AI will auto-expand keywords until target is reached.
+        <i class="fa-solid fa-shield-halved mr-1"></i> <b>Strict Mode:</b> Only leads with valid emails are counted. AI will auto-expand keywords until target is reached.
       </div>
       <button onclick="startJob()" id="btn-run" class="btn-p w-full py-3 rounded-xl text-sm"><i class="fa-solid fa-play mr-2"></i>Start Scraping & Automation</button>
     </div>
@@ -527,7 +557,7 @@ function setSt(msg, state='load', pct=null){
 
 function updStats(leads){
   document.getElementById('st').textContent=leads.length;
-  document.getElementById('se').textContent=leads.filter(l=>l.Email&&l.Email!='N/A').length;
+  document.getElementById('se').textContent=leads.length; // All leads now have emails
   document.getElementById('sp').textContent=leads.filter(l=>l.Phone&&l.Phone!='N/A').length;
   document.getElementById('sw').textContent=leads.filter(l=>l.Website&&l.Website!='N/A').length;
 }
@@ -683,7 +713,7 @@ bot_store = {}
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("🚀 Start Search", callback_data="start_manual")]]
-    await update.message.reply_text("👋 *LeadGen Pro Bot*\n\n✅ Fast Mode Extraction\n✅ Auto AI Keyword Expansion\n✅ Max Limit: 200\n\n_Note: For Email Automation, please use the Web Dashboard._", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("👋 *LeadGen Pro Bot*\n\n✅ Strict Valid Emails Only\n✅ Auto AI Keyword Expansion\n✅ Max Limit: 200\n\n_Note: For Email Automation, please use the Web Dashboard._", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
 
 async def handle_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -699,7 +729,7 @@ async def m_loc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def m_kw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot_store[update.message.from_user.id]['kw'] = update.message.text
-    await update.message.reply_text("🔢 Enter Target Number of Leads (Max 200):")
+    await update.message.reply_text("🔢 Enter Target Number of Valid Emails (Max 200):")
     return M_COUNT
 
 async def m_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -716,7 +746,7 @@ async def m_rating(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot_store[uid]['rating'] = None if txt == 'skip' else txt
     
     data = bot_store[uid]
-    txt_summary = f"📋 *Target Guarantee*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Target: {data['count']} Leads\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nStart Scraping?"
+    txt_summary = f"📋 *Target Guarantee*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Target: {data['count']} Valid Emails\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nStart Scraping?"
     kb = [[InlineKeyboardButton("✅ Start", callback_data="start_scrape")]]
     await update.message.reply_text(txt_summary, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
@@ -737,7 +767,7 @@ def run_bot_scrape_fast(data):
     kw_attempts = 0
     final_leads = []
     
-    while len(final_leads) < max_leads and kw_attempts < 10:
+    while len(final_leads) < max_leads and kw_attempts < 15:
         if not pending_keywords:
             new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
             pending_keywords.extend(new_kws)
@@ -757,7 +787,12 @@ def run_bot_scrape_fast(data):
                     if float(lead['Rating']) > float(max_rating): continue
                 except: pass
                 
-            lead['Email'] = email_lib.get_email(lead['Website'])
+            if lead['Website'] == "N/A": continue
+                
+            extracted_email = email_lib.get_email(lead['Website'])
+            if extracted_email == "N/A": continue
+            
+            lead['Email'] = extracted_email
             seen_names.add(lead['Name'])
             final_leads.append(lead)
             
@@ -779,7 +814,7 @@ async def background_bot_task(chat_id, message_id, data, bot):
         with open(path, 'rb') as f:
             await bot.send_document(
                 chat_id=chat_id, document=f, filename=f"Target_Leads.csv",
-                caption=f"🎯 *Target Reached!*\n📊 Total Leads: {len(final_leads)}", parse_mode='Markdown'
+                caption=f"🎯 *Target Reached!*\n📊 Total Valid Emails: {len(final_leads)}", parse_mode='Markdown'
             )
         os.unlink(path)
     except Exception as e:
