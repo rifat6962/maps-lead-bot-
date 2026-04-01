@@ -2,7 +2,6 @@ import os, csv, asyncio, tempfile, threading, io, uuid, re, time, json
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from outscraper import ApiClient as OutscraperClient
 from groq import Groq
 from flask import Flask, render_template_string, request, send_file, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -15,19 +14,18 @@ load_dotenv()
 
 # Global Config
 CONFIG = {
-    "TELEGRAM_TOKEN":    os.getenv("TELEGRAM_BOT_TOKEN"),
-    "OUTSCRAPER_KEY":    os.getenv("OUTSCRAPER_API_KEY", ""),
-    "GROQ_API_KEY":      os.getenv("GROQ_API_KEY", ""),
-    "SCRAPER_API_KEY":   os.getenv("SCRAPER_API_KEY", ""),
+    "TELEGRAM_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN"),
+    "SERPER_API_KEY": os.getenv("SERPER_API_KEY", ""), # Changed from APIFY to SERPER
+    "GROQ_API_KEY": os.getenv("GROQ_API_KEY", "")
 }
 
 # ══════════════════════════════════════════════
-#   GROQ AI BRAIN
+#   GROQ AI BRAIN (NATURAL LANGUAGE PARSER)
 # ══════════════════════════════════════════════
 def parse_with_ai(user_text):
     if not CONFIG["GROQ_API_KEY"]:
         raise Exception("Groq API Key is missing! Please add it in settings.")
-
+    
     client = Groq(api_key=CONFIG["GROQ_API_KEY"])
     prompt = f"""
     You are an AI assistant for a Google Maps Lead Generation tool.
@@ -43,6 +41,7 @@ def parse_with_ai(user_text):
     Return ONLY a valid JSON object. Do not include any other text.
     Example format: {{"loc": "Canada", "kw": "car showroom", "count": 50, "rating": 3.0, "reviews": null}}
     """
+    
     try:
         chat_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
@@ -55,98 +54,120 @@ def parse_with_ai(user_text):
             return json.loads(json_match.group(0))
         return json.loads(response)
     except Exception as e:
+        print(f"Groq Error: {e}")
         raise Exception("Failed to connect to Groq AI. Please check your API Key in Settings.")
 
 # ══════════════════════════════════════════════
-#   EMAIL EXTRACTOR (ScraperAPI + fallback)
+#   DEEP EMAIL EXTRACTOR (PYTHON SCRAPER)
 # ══════════════════════════════════════════════
 EMAIL_REGEX = r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
-EMAIL_SKIP  = ['example','domain','sentry','wixpress','noreply','@2x','.png','.jpg','no-reply','amazonaws']
-HEADERS     = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-
-def _fetch_html(url):
-    sk = CONFIG.get("SCRAPER_API_KEY", "")
-    if sk:
-        r = requests.get("http://api.scraperapi.com",
-                         params={"api_key": sk, "url": url, "render": "false"},
-                         timeout=30)
-    else:
-        r = requests.get(url, headers=HEADERS, timeout=8, verify=False)
-    r.raise_for_status()
-    return r.text
-
-def _valid_emails(emails):
-    return [e.lower() for e in emails
-            if not any(s in e.lower() for s in EMAIL_SKIP) and '.' in e.split('@')[-1]]
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 def extract_email_from_website(url):
     if not url or url == "N/A": return "N/A"
-    if not url.startswith("http"): url = "http://" + url
-    import urllib.parse
-    for path in ['', '/contact', '/contact-us', '/about']:
-        target = urllib.parse.urljoin(url, path)
-        try:
-            html = _fetch_html(target)
-            soup = BeautifulSoup(html, 'html.parser')
-            for a in soup.find_all('a', href=True):
-                if a['href'].startswith('mailto:'):
-                    e = a['href'].replace('mailto:', '').split('?')[0].strip()
-                    if _valid_emails([e]): return e
-            found = _valid_emails(re.findall(EMAIL_REGEX, html))
-            if found: return found[0]
-        except:
-            continue
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=8)
+        emails = re.findall(EMAIL_REGEX, r.text)
+        if emails: return emails[0]
+        
+        soup = BeautifulSoup(r.text, 'html.parser')
+        contact_link = None
+        for a in soup.find_all('a', href=True):
+            if 'contact' in a.get('href', '').lower():
+                contact_link = a['href']
+                break
+        
+        if contact_link:
+            if not contact_link.startswith('http'):
+                contact_link = url.rstrip('/') + '/' + contact_link.lstrip('/')
+            r2 = requests.get(contact_link, headers=HEADERS, timeout=8)
+            emails2 = re.findall(EMAIL_REGEX, r2.text)
+            if emails2: return emails2[0]
+    except:
+        pass
     return "N/A"
 
 # ══════════════════════════════════════════════
-#   OUTSCRAPER GOOGLE MAPS SCRAPER
+#   ADVANCED GOOGLE MAPS SCRAPER (SERPER.DEV)
 # ══════════════════════════════════════════════
 def scrape_advanced(location, keyword, max_leads=50, max_rating=None, min_reviews=None):
-    key = CONFIG.get("OUTSCRAPER_KEY", "")
-    if not key:
-        raise Exception("Outscraper API Key নেই! Settings এ গিয়ে যোগ করো।")
-
-    client = OutscraperClient(api_key=key)
-
-    results = client.google_maps_search(
-        f"{keyword} in {location}",
-        limit=int(max_leads),
-        language="en",
-    )
+    if not CONFIG["SERPER_API_KEY"]:
+        raise Exception("Serper API Key is missing! Get a free key from serper.dev and add it in Settings.")
+        
+    url = "https://google.serper.dev/places"
+    headers = {
+        'X-API-KEY': CONFIG["SERPER_API_KEY"],
+        'Content-Type': 'application/json'
+    }
 
     leads = []
-    for place in results[0] if results else []:
-        rating  = place.get("rating") or 0
-        reviews = place.get("reviews") or 0
+    seen_names = set()
+    max_leads = int(max_leads)
 
-        if max_rating and rating and float(rating) > float(max_rating):
+    # We use multiple query variations to get more results per search naturally
+    queries = [
+        f"{keyword} in {location}",
+        f"top rated {keyword} in {location}",
+        f"best {keyword} near {location}",
+        f"{keyword} services in {location}",
+        f"affordable {keyword} in {location}"
+    ]
+
+    for q in queries:
+        if len(leads) >= max_leads:
+            break
+
+        payload = json.dumps({"q": q})
+        try:
+            response = requests.post(url, headers=headers, data=payload)
+            data = response.json()
+        except Exception as e:
             continue
-        if min_reviews and reviews and int(reviews) < int(min_reviews):
-            continue
 
-        website = place.get("site") or place.get("website") or "N/A"
+        places = data.get("places", [])
+        
+        for item in places:
+            if len(leads) >= max_leads:
+                break
+                
+            name = item.get("title", "N/A")
+            if name in seen_names:
+                continue
+            seen_names.add(name)
 
-        # Outscraper sometimes gives emails directly
-        email = place.get("email") or "N/A"
-        if email == "N/A" and website != "N/A":
-            email = extract_email_from_website(website)
-            time.sleep(0.3)
-
-        leads.append({
-            "Name":      place.get("name", "N/A"),
-            "Phone":     place.get("phone", "N/A") or "N/A",
-            "Email":     email,
-            "Address":   place.get("full_address") or place.get("address", "N/A"),
-            "Category":  place.get("type") or place.get("subtypes", "N/A"),
-            "Rating":    rating or "N/A",
-            "Reviews":   reviews or "N/A",
-            "Website":   website,
-            "Maps_Link": place.get("place_link") or place.get("url", "N/A"),
-        })
+            rating = item.get("rating", 0)
+            reviews = item.get("ratingCount", 0)
+            
+            if max_rating and rating and float(rating) > float(max_rating): continue
+            if min_reviews and reviews and int(reviews) < int(min_reviews): continue
+            
+            website = item.get("website", "N/A")
+            email = "N/A"
+            
+            # Use our deep python scraper if there is a website
+            if website != "N/A":
+                email = extract_email_from_website(website)
+                time.sleep(0.3) # Prevent IP blocking from websites
+                
+            # Create a Google Maps URL manually
+            maps_link = f"https://www.google.com/maps/search/?api=1&query={name.replace(' ', '+')}+{location.replace(' ', '+')}"
+                
+            leads.append({
+                "Name": name,
+                "Phone": item.get("phoneNumber", "N/A"),
+                "Email": email,
+                "Address": item.get("address", "N/A"),
+                "Category": item.get("category", "N/A"),
+                "Rating": rating if rating else "N/A",
+                "Reviews": reviews if reviews else "N/A",
+                "Website": website,
+                "Maps_Link": maps_link,
+            })
+            
     return leads
 
 # ══════════════════════════════════════════════
-#   FLASK DASHBOARD
+#   WEB DASHBOARD (FLASK + DARK TAILWIND CSS)
 # ══════════════════════════════════════════════
 flask_app = Flask(__name__)
 jobs = {}
@@ -163,280 +184,242 @@ HTML_TEMPLATE = """
     <script>
         tailwind.config = {
             darkMode: 'class',
-            theme: { extend: { colors: { darkbg: '#0f172a', darkcard: '#1e293b', darkinput: '#334155' } } }
+            theme: {
+                extend: {
+                    colors: {
+                        darkbg: '#0f172a',
+                        darkcard: '#1e293b',
+                        darkinput: '#334155',
+                    }
+                }
+            }
         }
     </script>
     <style>
-        ::-webkit-scrollbar{width:8px}
-        ::-webkit-scrollbar-track{background:#1e293b}
-        ::-webkit-scrollbar-thumb{background:#475569;border-radius:4px}
-        ::-webkit-scrollbar-thumb:hover{background:#64748b}
-        .badge-ok{background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.4);color:#34d399;padding:2px 10px;border-radius:99px;font-size:11px;font-weight:600}
-        .badge-no{background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#f87171;padding:2px 10px;border-radius:99px;font-size:11px;font-weight:600}
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #1e293b; }
+        ::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #64748b; }
     </style>
 </head>
 <body class="bg-darkbg text-gray-200 font-sans antialiased min-h-screen">
-<div class="max-w-5xl mx-auto p-4 sm:p-6 lg:p-8">
-
-    <!-- Header -->
-    <header class="flex justify-between items-center bg-darkcard p-5 rounded-2xl shadow-lg mb-8 border border-gray-800">
-        <div class="flex items-center gap-4">
-            <div class="bg-gradient-to-br from-indigo-500 to-purple-600 text-white p-3 rounded-xl shadow-lg">
-                <i class="fa-solid fa-map-location-dot text-2xl"></i>
-            </div>
-            <div>
+    <div class="max-w-5xl mx-auto p-4 sm:p-6 lg:p-8">
+        <!-- Header -->
+        <header class="flex justify-between items-center bg-darkcard p-5 rounded-2xl shadow-lg mb-8 border border-gray-800">
+            <div class="flex items-center gap-4">
+                <div class="bg-gradient-to-br from-indigo-500 to-purple-600 text-white p-3 rounded-xl shadow-lg"><i class="fa-solid fa-map-location-dot text-2xl"></i></div>
                 <h1 class="text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-purple-400">LeadGen Pro</h1>
-                <div class="flex items-center gap-2 mt-1">
-                    <span id="os-badge" class="badge-no">Outscraper: Not Set</span>
-                    <span id="groq-badge" class="badge-no">Groq: Not Set</span>
-                    <span id="scraper-badge" class="hidden badge-ok"><i class="fa-solid fa-spider mr-1"></i>ScraperAPI ✓</span>
+            </div>
+            <button onclick="switchTab('settings')" class="text-gray-400 hover:text-white transition bg-gray-800 p-3 rounded-xl border border-gray-700"><i class="fa-solid fa-gear text-xl"></i></button>
+        </header>
+
+        <!-- Tabs -->
+        <div class="flex gap-4 mb-8">
+            <button onclick="switchTab('manual')" id="tab-manual" class="flex-1 py-4 font-bold rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow-lg transition transform hover:-translate-y-1">Manual Search</button>
+            <button onclick="switchTab('ai')" id="tab-ai" class="flex-1 py-4 font-bold rounded-xl bg-darkcard text-gray-400 shadow-md border border-gray-700 hover:bg-gray-800 transition transform hover:-translate-y-1">AI Agent Search</button>
+        </div>
+
+        <!-- Manual Tab -->
+        <div id="content-manual" class="bg-darkcard p-8 rounded-2xl shadow-xl border border-gray-800">
+            <h2 class="text-2xl font-bold mb-6 text-white flex items-center gap-2"><i class="fa-solid fa-sliders text-indigo-400"></i> Manual Parameters</h2>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+                <div><label class="block text-sm font-medium mb-2 text-gray-400">Location *</label><input id="m-loc" type="text" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., New York, NY"></div>
+                <div><label class="block text-sm font-medium mb-2 text-gray-400">Keyword *</label><input id="m-kw" type="text" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., Real Estate Agency"></div>
+                <div><label class="block text-sm font-medium mb-2 text-gray-400">Number of Leads</label><input id="m-count" type="number" value="50" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none"></div>
+                <div><label class="block text-sm font-medium mb-2 text-gray-400">Max Rating (Optional)</label><input id="m-rating" type="number" step="0.1" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., 4.5"></div>
+            </div>
+            <button onclick="startManual()" id="btn-manual" class="w-full bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 text-white font-bold py-4 rounded-xl shadow-lg transition text-lg"><i class="fa-solid fa-rocket mr-2"></i> Start Scraping</button>
+        </div>
+
+        <!-- AI Tab -->
+        <div id="content-ai" class="hidden bg-darkcard rounded-2xl shadow-xl border border-gray-800 flex flex-col h-[600px]">
+            <div class="bg-gradient-to-r from-indigo-600 to-purple-600 text-white p-5 rounded-t-2xl font-bold flex items-center gap-3 text-lg">
+                <i class="fa-solid fa-robot text-2xl"></i> Groq AI Lead Generation Agent
+            </div>
+            <div id="chat-box" class="flex-1 p-6 overflow-y-auto bg-[#0f172a] space-y-5">
+                <div class="flex gap-4">
+                    <div class="bg-darkcard border border-gray-700 text-gray-200 p-4 rounded-2xl rounded-tl-none max-w-[85%] shadow-md">
+                        Hello! I am your AI Agent powered by Groq. Tell me exactly what you need in plain English.<br><br>
+                        <span class="text-indigo-400 italic">Example: "I need 50 leads for car showrooms in Canada with maximum 3 star rating."</span>
+                    </div>
                 </div>
             </div>
-        </div>
-        <button onclick="switchTab('settings')" class="text-gray-400 hover:text-white transition bg-gray-800 p-3 rounded-xl border border-gray-700">
-            <i class="fa-solid fa-gear text-xl"></i>
-        </button>
-    </header>
-
-    <!-- Tabs -->
-    <div class="flex gap-4 mb-8">
-        <button onclick="switchTab('manual')" id="tab-manual" class="flex-1 py-4 font-bold rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow-lg transition transform hover:-translate-y-1">Manual Search</button>
-        <button onclick="switchTab('ai')" id="tab-ai" class="flex-1 py-4 font-bold rounded-xl bg-darkcard text-gray-400 shadow-md border border-gray-700 hover:bg-gray-800 transition transform hover:-translate-y-1">AI Agent Search</button>
-    </div>
-
-    <!-- Manual Tab -->
-    <div id="content-manual" class="bg-darkcard p-8 rounded-2xl shadow-xl border border-gray-800">
-        <h2 class="text-2xl font-bold mb-6 text-white flex items-center gap-2">
-            <i class="fa-solid fa-sliders text-indigo-400"></i> Manual Parameters
-        </h2>
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
-            <div>
-                <label class="block text-sm font-medium mb-2 text-gray-400">Location *</label>
-                <input id="m-loc" type="text" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., New York, NY">
-            </div>
-            <div>
-                <label class="block text-sm font-medium mb-2 text-gray-400">Keyword *</label>
-                <input id="m-kw" type="text" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., Real Estate Agency">
-            </div>
-            <div>
-                <label class="block text-sm font-medium mb-2 text-gray-400">Number of Leads</label>
-                <input id="m-count" type="number" value="50" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none">
-            </div>
-            <div>
-                <label class="block text-sm font-medium mb-2 text-gray-400">Max Rating (Optional)</label>
-                <input id="m-rating" type="number" step="0.1" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., 4.5">
+            <div class="p-4 bg-darkcard border-t border-gray-800 flex gap-3 rounded-b-2xl">
+                <input id="ai-input" type="text" class="flex-1 bg-darkinput border border-gray-600 rounded-xl p-4 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="Type your request here..." onkeypress="if(event.key === 'Enter') sendAI()">
+                <button onclick="sendAI()" class="bg-gradient-to-r from-indigo-500 to-purple-600 text-white px-8 rounded-xl hover:shadow-lg transition"><i class="fa-solid fa-paper-plane text-xl"></i></button>
             </div>
         </div>
-        <button onclick="startManual()" class="w-full bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 text-white font-bold py-4 rounded-xl shadow-lg transition text-lg">
-            <i class="fa-solid fa-rocket mr-2"></i> Start Scraping
-        </button>
-    </div>
 
-    <!-- AI Tab -->
-    <div id="content-ai" class="hidden bg-darkcard rounded-2xl shadow-xl border border-gray-800 flex flex-col h-[600px]">
-        <div class="bg-gradient-to-r from-indigo-600 to-purple-600 text-white p-5 rounded-t-2xl font-bold flex items-center gap-3 text-lg">
-            <i class="fa-solid fa-robot text-2xl"></i> Groq AI Lead Generation Agent
-        </div>
-        <div id="chat-box" class="flex-1 p-6 overflow-y-auto bg-[#0f172a] space-y-5">
-            <div class="flex gap-4">
-                <div class="bg-darkcard border border-gray-700 text-gray-200 p-4 rounded-2xl rounded-tl-none max-w-[85%] shadow-md">
-                    Hello! I am your AI Agent. Tell me what you need in plain English.<br><br>
-                    <span class="text-indigo-400 italic">Example: "I need 50 leads for car showrooms in Canada with maximum 3 star rating."</span>
+        <!-- Settings Tab -->
+        <div id="content-settings" class="hidden bg-darkcard p-8 rounded-2xl shadow-xl border border-gray-800">
+            <h2 class="text-2xl font-bold mb-6 text-white flex items-center gap-2"><i class="fa-solid fa-key text-yellow-500"></i> API Settings</h2>
+            <div class="space-y-6">
+                <div>
+                    <label class="block text-sm font-medium mb-2 text-gray-400">Serper API Key (Free 2500 Searches)</label>
+                    <input id="api-key" type="password" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="Enter Serper.dev API Key">
+                    <p class="text-xs text-gray-400 mt-2">Get your free key from <a href="https://serper.dev/" target="_blank" class="text-indigo-400 underline">serper.dev</a></p>
                 </div>
-            </div>
-        </div>
-        <div class="p-4 bg-darkcard border-t border-gray-800 flex gap-3 rounded-b-2xl">
-            <input id="ai-input" type="text" class="flex-1 bg-darkinput border border-gray-600 rounded-xl p-4 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="Type your request..." onkeypress="if(event.key==='Enter')sendAI()">
-            <button onclick="sendAI()" class="bg-gradient-to-r from-indigo-500 to-purple-600 text-white px-8 rounded-xl hover:shadow-lg transition">
-                <i class="fa-solid fa-paper-plane text-xl"></i>
-            </button>
-        </div>
-    </div>
-
-    <!-- Settings Tab -->
-    <div id="content-settings" class="hidden bg-darkcard p-8 rounded-2xl shadow-xl border border-gray-800">
-        <h2 class="text-2xl font-bold mb-6 text-white flex items-center gap-2">
-            <i class="fa-solid fa-key text-yellow-500"></i> API Settings
-        </h2>
-        <div class="space-y-6">
-
-            <!-- Outscraper -->
-            <div>
-                <label class="block text-sm font-medium mb-2 text-gray-400">
-                    <i class="fa-solid fa-map-location-dot text-indigo-400 mr-1"></i>
-                    Outscraper API Key <span class="text-red-400">*</span> (Google Maps Scraper)
-                </label>
-                <input id="outscraper-key" type="password" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="Enter Outscraper API Key">
-                <div class="mt-2 p-3 rounded-xl text-xs text-gray-400" style="background:rgba(99,102,241,0.07);border:1px solid rgba(99,102,241,0.2)">
-                    <i class="fa-solid fa-circle-info mr-1 text-indigo-400"></i>
-                    Free monthly tier প্রতি মাসে reset হয় &nbsp;·&nbsp; Pay-as-you-go: ~$0.003/record &nbsp;·&nbsp;
-                    <a href="https://outscraper.com/" target="_blank" class="text-indigo-400 underline">outscraper.com</a> থেকে free account করো
+                <div>
+                    <label class="block text-sm font-medium mb-2 text-gray-400">Groq API Key (For AI Brain)</label>
+                    <input id="groq-key" type="password" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="Enter Groq API Key">
+                    <p class="text-xs text-gray-400 mt-2">Get your free key from <a href="https://console.groq.com/keys" target="_blank" class="text-indigo-400 underline">console.groq.com</a></p>
                 </div>
+                <button onclick="saveSettings()" class="w-full bg-gradient-to-r from-blue-500 to-indigo-600 text-white font-bold py-3 rounded-xl shadow-lg hover:shadow-xl transition">Save Settings</button>
             </div>
+        </div>
 
-            <!-- Groq -->
-            <div>
-                <label class="block text-sm font-medium mb-2 text-gray-400">
-                    <i class="fa-solid fa-robot text-purple-400 mr-1"></i>
-                    Groq API Key (AI Agent এর জন্য)
-                </label>
-                <input id="groq-key" type="password" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="gsk_...">
-                <p class="text-xs text-gray-400 mt-2">
-                    Free → <a href="https://console.groq.com/keys" target="_blank" class="text-indigo-400 underline">console.groq.com</a>
-                </p>
+        <!-- Status Area -->
+        <div id="status-area" class="hidden mt-8 p-6 rounded-2xl border bg-darkcard border-gray-700 shadow-xl">
+            <div class="flex items-center gap-4 mb-4">
+                <i id="status-icon" class="fa-solid fa-circle-notch fa-spin text-indigo-500 text-3xl"></i>
+                <span id="status-text" class="text-xl font-semibold text-white">Processing...</span>
             </div>
-
-            <!-- ScraperAPI -->
-            <div>
-                <label class="block text-sm font-medium mb-2 text-gray-400">
-                    <i class="fa-solid fa-spider text-yellow-400 mr-1"></i>
-                    ScraperAPI Key (Email extraction — optional)
-                </label>
-                <input id="scraper-key" type="password" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="Optional — না থাকলে direct request যাবে">
-                <p class="text-xs text-gray-400 mt-2">
-                    1000 free req/month → <a href="https://www.scraperapi.com/" target="_blank" class="text-yellow-400 underline">scraperapi.com</a>
-                </p>
-            </div>
-
-            <button onclick="saveSettings()" class="w-full bg-gradient-to-r from-blue-500 to-indigo-600 text-white font-bold py-3 rounded-xl shadow-lg hover:shadow-xl transition">
-                <i class="fa-solid fa-save mr-2"></i>Save All Settings
-            </button>
-            <div id="save-ok" class="hidden text-center text-sm text-green-400 py-2">✅ Settings সেভ হয়ে গেছে!</div>
+            <button id="dl-btn" class="hidden w-full mt-4 bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 text-white font-bold py-4 rounded-xl shadow-lg transition text-lg"><i class="fa-solid fa-download mr-2"></i> Download CSV</button>
         </div>
     </div>
 
-    <!-- Status Area -->
-    <div id="status-area" class="hidden mt-8 p-6 rounded-2xl border bg-darkcard border-gray-700 shadow-xl">
-        <div class="flex items-center gap-4 mb-4">
-            <i id="status-icon" class="fa-solid fa-circle-notch fa-spin text-indigo-500 text-3xl"></i>
-            <span id="status-text" class="text-xl font-semibold text-white">Processing...</span>
-        </div>
-        <div id="status-detail" class="text-sm text-gray-400 mb-2"></div>
-        <button id="dl-btn" class="hidden w-full mt-4 bg-gradient-to-r from-green-500 to-emerald-600 text-white font-bold py-4 rounded-xl shadow-lg transition text-lg">
-            <i class="fa-solid fa-download mr-2"></i> Download CSV
-        </button>
-    </div>
-</div>
+    <script>
+        let currentJob = null;
+        let aiState = {};
 
-<script>
-let currentJob = null, aiState = {};
+        function switchTab(tab) {
+            ['manual', 'ai', 'settings'].forEach(t => {
+                document.getElementById('content-'+t).classList.add('hidden');
+                let btn = document.getElementById('tab-'+t);
+                if(btn) btn.className = 'flex-1 py-4 font-bold rounded-xl bg-darkcard text-gray-400 shadow-md border border-gray-700 hover:bg-gray-800 transition transform hover:-translate-y-1';
+            });
+            document.getElementById('content-'+tab).classList.remove('hidden');
+            let activeBtn = document.getElementById('tab-'+tab);
+            if(activeBtn) activeBtn.className = 'flex-1 py-4 font-bold rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow-lg transition transform hover:-translate-y-1';
+        }
 
-window.onload = () => {
-    const ok = localStorage.getItem('outscraper_key');
-    const gk = localStorage.getItem('groq_key');
-    const sk = localStorage.getItem('scraper_key');
-    if(ok) { document.getElementById('outscraper-key').value = ok; setBadge('os-badge', true, 'Outscraper'); }
-    if(gk) { document.getElementById('groq-key').value = gk;       setBadge('groq-badge', true, 'Groq'); }
-    if(sk) { document.getElementById('scraper-key').value = sk;    document.getElementById('scraper-badge').classList.remove('hidden'); }
-    if(ok||gk||sk) fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({outscraper:ok||'',groq:gk||'',scraper:sk||''})});
-};
+        function saveSettings() {
+            const serper = document.getElementById('api-key').value;
+            const groq = document.getElementById('groq-key').value;
+            fetch('/api/settings', { 
+                method: 'POST', 
+                headers: {'Content-Type':'application/json'}, 
+                body: JSON.stringify({serper: serper, groq: groq}) 
+            }).then(() => alert('Settings Saved Successfully!'));
+        }
 
-function setBadge(id, ok, label) {
-    const el = document.getElementById(id);
-    if(!el) return;
-    el.textContent = ok ? label+': ✓ Active' : label+': Not Set';
-    el.className = ok ? 'badge-ok' : 'badge-no';
-}
+        function showStatus(msg, isSpin=true, isError=false) {
+            const area = document.getElementById('status-area');
+            area.classList.remove('hidden');
+            document.getElementById('status-text').innerText = msg;
+            
+            const icon = document.getElementById('status-icon');
+            if(isSpin) {
+                icon.className = 'fa-solid fa-circle-notch fa-spin text-indigo-500 text-3xl';
+            } else if(isError) {
+                icon.className = 'fa-solid fa-circle-xmark text-red-500 text-3xl';
+            } else {
+                icon.className = 'fa-solid fa-circle-check text-green-500 text-3xl';
+            }
+            document.getElementById('dl-btn').classList.add('hidden');
+        }
 
-function switchTab(tab) {
-    ['manual','ai','settings'].forEach(t => {
-        document.getElementById('content-'+t).classList.add('hidden');
-        let btn = document.getElementById('tab-'+t);
-        if(btn) btn.className='flex-1 py-4 font-bold rounded-xl bg-darkcard text-gray-400 shadow-md border border-gray-700 hover:bg-gray-800 transition transform hover:-translate-y-1';
-    });
-    document.getElementById('content-'+tab).classList.remove('hidden');
-    let ab = document.getElementById('tab-'+tab);
-    if(ab) ab.className='flex-1 py-4 font-bold rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow-lg transition transform hover:-translate-y-1';
-}
+        async function startJob(payload) {
+            showStatus('Google Maps API Searching & Extracting Emails...');
+            const res = await fetch('/api/scrape', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+            const data = await res.json();
+            if(data.error) return showStatus(data.error, false, true);
+            
+            currentJob = data.job_id;
+            checkStatus();
+        }
 
-function saveSettings() {
-    const ok = document.getElementById('outscraper-key').value.trim();
-    const gk = document.getElementById('groq-key').value.trim();
-    const sk = document.getElementById('scraper-key').value.trim();
-    if(ok){ localStorage.setItem('outscraper_key',ok); setBadge('os-badge',true,'Outscraper'); }
-    if(gk){ localStorage.setItem('groq_key',gk);       setBadge('groq-badge',true,'Groq'); }
-    if(sk){ localStorage.setItem('scraper_key',sk);    document.getElementById('scraper-badge').classList.remove('hidden'); }
-    fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({outscraper:ok,groq:gk,scraper:sk})})
-    .then(()=>{ const m=document.getElementById('save-ok'); m.classList.remove('hidden'); setTimeout(()=>m.classList.add('hidden'),3000); });
-}
+        function startManual() {
+            const loc = document.getElementById('m-loc').value;
+            const kw = document.getElementById('m-kw').value;
+            if(!loc || !kw) return alert("Location and Keyword are required!");
+            
+            startJob({
+                location: loc, keyword: kw,
+                max_leads: document.getElementById('m-count').value || 50,
+                max_rating: document.getElementById('m-rating').value || null
+            });
+        }
 
-function showStatus(msg, state='loading', detail='') {
-    document.getElementById('status-area').classList.remove('hidden');
-    document.getElementById('status-text').innerText = msg;
-    document.getElementById('status-detail').innerText = detail;
-    const icon = document.getElementById('status-icon');
-    if(state==='loading') icon.className='fa-solid fa-circle-notch fa-spin text-indigo-500 text-3xl';
-    else if(state==='done') icon.className='fa-solid fa-circle-check text-green-500 text-3xl';
-    else icon.className='fa-solid fa-circle-xmark text-red-500 text-3xl';
-    document.getElementById('dl-btn').classList.add('hidden');
-}
+        async function checkStatus() {
+            const res = await fetch('/api/status/' + currentJob);
+            const data = await res.json();
+            if(data.status === 'done') {
+                showStatus(`Success! Found ${data.count} leads.`, false, false);
+                const btn = document.getElementById('dl-btn');
+                btn.classList.remove('hidden');
+                btn.onclick = () => window.location = '/api/download/' + currentJob;
+            } else if(data.status === 'error') {
+                showStatus('Error: ' + data.error, false, true);
+            } else {
+                setTimeout(checkStatus, 5000);
+            }
+        }
 
-async function startJob(payload) {
-    showStatus('Outscraper দিয়ে Google Maps scraping শুরু হয়েছে...','loading');
-    const res=await fetch('/api/scrape',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-    const data=await res.json();
-    if(data.error) return showStatus(data.error,'error');
-    currentJob=data.job_id;
-    checkStatus();
-}
+        function addMsg(text, isBot=false, isHtml=false) {
+            const box = document.getElementById('chat-box');
+            const div = document.createElement('div');
+            div.className = `flex gap-4 ${isBot ? '' : 'justify-end'}`;
+            
+            let contentClass = isBot 
+                ? 'bg-darkcard border border-gray-700 text-gray-200 p-4 rounded-2xl rounded-tl-none shadow-md' 
+                : 'bg-gradient-to-r from-indigo-500 to-purple-600 text-white p-4 rounded-2xl rounded-tr-none shadow-md';
+            
+            div.innerHTML = `<div class="${contentClass} max-w-[85%]">${isHtml ? text : text.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</div>`;
+            box.appendChild(div);
+            box.scrollTop = box.scrollHeight;
+        }
 
-function startManual() {
-    const loc=document.getElementById('m-loc').value.trim();
-    const kw=document.getElementById('m-kw').value.trim();
-    if(!loc||!kw) return alert("Location এবং Keyword দাও!");
-    startJob({location:loc,keyword:kw,max_leads:document.getElementById('m-count').value||50,max_rating:document.getElementById('m-rating').value||null});
-}
+        async function sendAI() {
+            const inp = document.getElementById('ai-input');
+            const text = inp.value.trim();
+            if(!text) return;
+            addMsg(text, false);
+            inp.value = '';
 
-async function checkStatus() {
-    const res=await fetch('/api/status/'+currentJob);
-    const data=await res.json();
-    if(data.status==='done'){
-        showStatus(`✅ সম্পন্ন! ${data.count} টি lead পাওয়া গেছে।`,'done',
-            `📧 Email: ${data.emails} | 📞 Phone: ${data.phones} | 🌐 Website: ${data.websites}`);
-        const btn=document.getElementById('dl-btn');
-        btn.classList.remove('hidden');
-        btn.onclick=()=>window.location='/api/download/'+currentJob;
-    } else if(data.status==='error'){
-        showStatus('Error: '+data.error,'error');
-    } else { setTimeout(checkStatus,5000); }
-}
+            const box = document.getElementById('chat-box');
+            const loadDiv = document.createElement('div');
+            loadDiv.id = 'typing-indicator';
+            loadDiv.className = 'flex gap-4';
+            loadDiv.innerHTML = `<div class="bg-darkcard border border-gray-700 text-gray-400 p-4 rounded-2xl rounded-tl-none shadow-md"><i class="fa-solid fa-ellipsis fa-fade text-xl"></i></div>`;
+            box.appendChild(loadDiv);
+            box.scrollTop = box.scrollHeight;
 
-function addMsg(text,isBot=false,isHtml=false){
-    const box=document.getElementById('chat-box');
-    const div=document.createElement('div');
-    div.className=`flex gap-4 ${isBot?'':'justify-end'}`;
-    let cls=isBot?'bg-darkcard border border-gray-700 text-gray-200 p-4 rounded-2xl rounded-tl-none shadow-md':'bg-gradient-to-r from-indigo-500 to-purple-600 text-white p-4 rounded-2xl rounded-tr-none shadow-md';
-    div.innerHTML=`<div class="${cls} max-w-[85%]">${isHtml?text:text.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>`;
-    box.appendChild(div);
-    box.scrollTop=box.scrollHeight;
-}
+            try {
+                const res = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({text: text, state: aiState})
+                });
+                const data = await res.json();
+                
+                document.getElementById('typing-indicator').remove();
 
-async function sendAI(){
-    const inp=document.getElementById('ai-input');
-    const text=inp.value.trim(); if(!text)return;
-    addMsg(text,false); inp.value='';
-    const box=document.getElementById('chat-box');
-    const ld=document.createElement('div');
-    ld.id='typing-indicator'; ld.className='flex gap-4';
-    ld.innerHTML='<div class="bg-darkcard border border-gray-700 text-gray-400 p-4 rounded-2xl rounded-tl-none shadow-md"><i class="fa-solid fa-ellipsis fa-fade text-xl"></i></div>';
-    box.appendChild(ld); box.scrollTop=box.scrollHeight;
-    try{
-        const res=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,state:aiState})});
-        const data=await res.json();
-        document.getElementById('typing-indicator').remove();
-        if(data.error){addMsg(data.error,true);return;}
-        if(data.ready){
-            aiState=data.state;
-            let s=`Got it!<br><br>📍 <b>${aiState.loc}</b><br>🔍 <b>${aiState.kw}</b><br>🔢 <b>${aiState.count}</b> leads<br>`;
-            if(aiState.rating) s+=`⭐ Max Rating: <b>${aiState.rating}</b><br>`;
-            s+=`<br><button onclick='startJob(${JSON.stringify({location:aiState.loc,keyword:aiState.kw,max_leads:aiState.count,max_rating:aiState.rating})})' class='mt-3 bg-gradient-to-r from-green-500 to-emerald-600 text-white px-6 py-2 rounded-lg font-bold shadow hover:shadow-lg transition'>🚀 Start Automation</button>`;
-            addMsg(s,true,true);
-        }else{addMsg(data.reply,true);}
-    }catch(e){document.getElementById('typing-indicator').remove();addMsg("Server error.",true);}
-}
-</script>
+                if(data.error) {
+                    addMsg(data.error, true);
+                    return;
+                }
+
+                if(data.ready) {
+                    aiState = data.state;
+                    let summary = `Got it! Here is what I understood:<br><br>
+                    📍 <b>Location:</b> ${aiState.loc}<br>
+                    🔍 <b>Keyword:</b> ${aiState.kw}<br>
+                    🔢 <b>Leads:</b> ${aiState.count}<br>`;
+                    if(aiState.rating) summary += `⭐ <b>Max Rating:</b> ${aiState.rating}<br>`;
+                    
+                    summary += `<br><button onclick='startJob(${JSON.stringify({location: aiState.loc, keyword: aiState.kw, max_leads: aiState.count, max_rating: aiState.rating})})' class='mt-3 bg-gradient-to-r from-green-500 to-emerald-600 text-white px-6 py-2 rounded-lg font-bold shadow hover:shadow-lg transition'>🚀 Start Automation</button>`;
+                    
+                    addMsg(summary, true, true);
+                } else {
+                    addMsg(data.reply, true);
+                }
+            } catch (err) {
+                document.getElementById('typing-indicator').remove();
+                addMsg("Error communicating with server.", true);
+            }
+        }
+    </script>
 </body>
 </html>
 """
@@ -447,74 +430,82 @@ def index():
 
 @flask_app.route('/api/settings', methods=['POST'])
 def update_settings():
-    d = request.json or {}
-    if d.get('outscraper'): CONFIG["OUTSCRAPER_KEY"]  = d['outscraper']
-    if d.get('groq'):       CONFIG["GROQ_API_KEY"]    = d['groq']
-    if d.get('scraper'):    CONFIG["SCRAPER_API_KEY"] = d['scraper']
+    if request.json.get('serper'): CONFIG["SERPER_API_KEY"] = request.json.get('serper')
+    if request.json.get('groq'): CONFIG["GROQ_API_KEY"] = request.json.get('groq')
     return jsonify({"success": True})
 
 @flask_app.route('/api/chat', methods=['POST'])
 def handle_chat():
-    text = request.json.get('text', '')
+    text = request.json.get('text')
+    
     if text.lower() in ['yes', 'start', 'do it', 'go']:
         return jsonify({"ready": True, "state": request.json.get('state')})
+
     try:
         parsed = parse_with_ai(text)
     except Exception as e:
         return jsonify({"error": str(e)})
+    
     if not parsed:
         return jsonify({"error": "Failed to parse input. Try again."})
+
     state = request.json.get('state', {})
-    if parsed.get('loc'):    state['loc']    = parsed['loc']
-    if parsed.get('kw'):     state['kw']     = parsed['kw']
-    if parsed.get('count'):  state['count']  = parsed['count']
+    if parsed.get('loc'): state['loc'] = parsed['loc']
+    if parsed.get('kw'): state['kw'] = parsed['kw']
+    if parsed.get('count'): state['count'] = parsed['count']
     if parsed.get('rating'): state['rating'] = parsed['rating']
+
     if not state.get('loc') or not state.get('kw'):
-        reply = "আরেকটু বলো: "
-        if not state.get('loc'): reply += "📍 Location "
-        if not state.get('kw'):  reply += "🔍 Keyword"
+        reply = "I still need a bit more info. "
+        if not state.get('loc'): reply += "Which **location** are you targeting? "
+        if not state.get('kw'): reply += "What **keyword or niche** are you looking for?"
         return jsonify({"ready": False, "reply": reply})
+    
     return jsonify({"ready": True, "state": state})
 
 def run_scrape_thread(job_id, data):
     try:
         jobs[job_id] = {'status': 'running'}
         leads = scrape_advanced(
-            data.get('location'), data.get('keyword'),
-            data.get('max_leads', 50), data.get('max_rating'), data.get('min_reviews'),
+            data.get('location'), 
+            data.get('keyword'),
+            data.get('max_leads', 50),
+            data.get('max_rating'),
+            data.get('min_reviews')
         )
-        jobs[job_id] = {
-            'status':   'done', 'leads': leads, 'count': len(leads),
-            'emails':   sum(1 for l in leads if l.get('Email','N/A') not in ('N/A','')),
-            'phones':   sum(1 for l in leads if l.get('Phone','N/A') not in ('N/A','')),
-            'websites': sum(1 for l in leads if l.get('Website','N/A') not in ('N/A','')),
-        }
+        jobs[job_id] = {'status': 'done', 'leads': leads, 'count': len(leads)}
     except Exception as e:
         jobs[job_id] = {'status': 'error', 'error': str(e)}
 
 @flask_app.route('/api/scrape', methods=['POST'])
 def start_api_job():
+    data = request.json
     job_id = str(uuid.uuid4())[:8]
-    threading.Thread(target=run_scrape_thread, args=(job_id, request.json), daemon=True).start()
+    t = threading.Thread(target=run_scrape_thread, args=(job_id, data))
+    t.daemon = True
+    t.start()
     return jsonify({'job_id': job_id})
 
 @flask_app.route('/api/status/<job_id>')
 def status(job_id):
-    j = jobs.get(job_id, {'status': 'not_found'})
-    return jsonify({'status':j['status'],'count':j.get('count',0),
-                    'emails':j.get('emails',0),'phones':j.get('phones',0),
-                    'websites':j.get('websites',0),'error':j.get('error')})
+    job = jobs.get(job_id, {'status': 'not_found'})
+    return jsonify({'status': job['status'], 'count': job.get('count', 0), 'error': job.get('error')})
 
 @flask_app.route('/api/download/<job_id>')
 def download(job_id):
-    j = jobs.get(job_id)
-    if not j or j['status'] != 'done': return "Not ready", 400
-    leads = j['leads']
+    job = jobs.get(job_id)
+    if not job or job['status'] != 'done': return "Not ready", 400
+    leads = job['leads']
+    
+    if len(leads) == 0:
+        return "No leads found", 404
+        
     out = io.StringIO()
     writer = csv.DictWriter(out, fieldnames=leads[0].keys())
-    writer.writeheader(); writer.writerows(leads); out.seek(0)
-    return send_file(io.BytesIO(out.getvalue().encode('utf-8-sig')),
-                     mimetype='text/csv', as_attachment=True, download_name='leads.csv')
+    writer.writeheader()
+    writer.writerows(leads)
+    out.seek(0)
+    return send_file(io.BytesIO(out.getvalue().encode('utf-8-sig')), mimetype='text/csv', as_attachment=True, download_name='advanced_leads.csv')
 
 # ══════════════════════════════════════════════
 #   TELEGRAM BOT
@@ -522,57 +513,73 @@ def download(job_id):
 def to_csv(leads):
     tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8-sig', newline='')
     writer = csv.DictWriter(tmp, fieldnames=leads[0].keys())
-    writer.writeheader(); writer.writerows(leads); tmp.close()
+    writer.writeheader()
+    writer.writerows(leads)
+    tmp.close()
     return tmp.name
 
 M_LOC, M_KW, M_COUNT, M_RATING, AI_PROMPT = range(5)
 bot_store = {}
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    kb = [[InlineKeyboardButton("🛠️ Manual Search", callback_data="mode_manual")],
-          [InlineKeyboardButton("🤖 Groq AI Search", callback_data="mode_ai")]]
-    await update.message.reply_text("👋 *Pro Lead Gen Bot*\n\nকীভাবে সার্চ করতে চাও?",
-                                    parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    kb = [
+        [InlineKeyboardButton("🛠️ Manual Search", callback_data="mode_manual")],
+        [InlineKeyboardButton("🤖 Groq AI Search", callback_data="mode_ai")]
+    ]
+    await update.message.reply_text("👋 *Pro Lead Gen Bot (Unlimited API)*\n\nকীভাবে সার্চ করতে চাও?", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
 
 async def handle_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    uid = q.from_user.id; bot_store[uid] = {}
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    bot_store[uid] = {}
+    
     if q.data == "mode_manual":
-        await q.edit_message_text("📍 *Manual Mode*\nLocation দাও:", parse_mode='Markdown')
+        await q.edit_message_text("📍 *Manual Mode*\nLocation দাও (e.g. Dhaka):", parse_mode='Markdown')
         return M_LOC
     else:
-        await q.edit_message_text("🤖 *Groq AI Mode*\nইংরেজিতে বলো কী খুঁজছো।\n_Example: 50 leads for car showrooms in Canada_", parse_mode='Markdown')
+        await q.edit_message_text("🤖 *Groq AI Mode*\nআমাকে ইংরেজিতে বলো তুমি কী খুঁজছো।\n\n_Example: I need 100 leads for plumbers in Texas_", parse_mode='Markdown')
         return AI_PROMPT
 
-async def m_loc(update, ctx):
+async def m_loc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot_store[update.message.from_user.id]['loc'] = update.message.text
-    await update.message.reply_text("🔍 Keyword দাও:")
+    await update.message.reply_text("🔍 Keyword দাও (e.g. restaurant):")
     return M_KW
 
-async def m_kw(update, ctx):
+async def m_kw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot_store[update.message.from_user.id]['kw'] = update.message.text
-    await update.message.reply_text("🔢 কয়টা lead লাগবে?:")
+    await update.message.reply_text("🔢 কয়টা লিড লাগবে? (e.g. 50, 100):")
     return M_COUNT
 
-async def m_count(update, ctx):
+async def m_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot_store[update.message.from_user.id]['count'] = update.message.text
-    await update.message.reply_text("⭐ Max Rating ফিল্টার? (না হলে 'skip'):")
+    await update.message.reply_text("⭐ Max Rating ফিল্টার করবে? (না চাইলে 'skip' লেখো):")
     return M_RATING
 
-async def m_rating(update, ctx):
-    txt = update.message.text.lower(); uid = update.message.from_user.id
+async def m_rating(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.lower()
+    uid = update.message.from_user.id
     bot_store[uid]['rating'] = None if txt == 'skip' else txt
     return await ask_confirm(update, uid)
 
-async def ai_prompt(update, ctx):
-    text = update.message.text; uid = update.message.from_user.id
+async def ai_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    uid = update.message.from_user.id
+    
     msg = await update.message.reply_text("🤖 _Thinking..._", parse_mode='Markdown')
+    
     try:
         parsed = parse_with_ai(text)
         if not parsed.get('loc') or not parsed.get('kw'):
-            await msg.edit_text("Location ও Keyword পরিষ্কার করে বলো।")
+            await msg.edit_text("🤖 আমি ঠিক বুঝতে পারিনি। দয়া করে Keyword এবং Location পরিষ্কার করে বলো।")
             return AI_PROMPT
-        bot_store[uid] = {'loc':parsed['loc'],'kw':parsed['kw'],'count':parsed.get('count',50),'rating':parsed.get('rating')}
+            
+        bot_store[uid] = {
+            'loc': parsed['loc'],
+            'kw': parsed['kw'],
+            'count': parsed.get('count', 50),
+            'rating': parsed.get('rating')
+        }
         await msg.delete()
         return await ask_confirm(update, uid)
     except Exception as e:
@@ -581,52 +588,62 @@ async def ai_prompt(update, ctx):
 
 async def ask_confirm(update, uid):
     data = bot_store[uid]
-    txt = f"📋 *Summary*\n📍 {data['loc']}\n🔍 {data['kw']}\n🔢 {data['count']} leads\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nশুরু করবো?"
-    kb = [[InlineKeyboardButton("✅ Start", callback_data="start_scrape")]]
+    txt = f"📋 *Summary*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Leads: {data['count']}\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nশুরু করবো?"
+    kb = [[InlineKeyboardButton("✅ Start Scraping", callback_data="start_scrape")]]
     await update.message.reply_text(txt, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
 
-async def execute_scrape(update: Update, ctx):
-    q = update.callback_query; await q.answer()
-    uid = q.from_user.id; data = bot_store.get(uid)
-    msg = await q.edit_message_text("⏳ *Outscraper দিয়ে scraping চলছে...*", parse_mode='Markdown')
+async def execute_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    data = bot_store.get(uid)
+    
+    msg = await q.edit_message_text("⏳ *Google Maps Search & Email Extraction চলছে...*\n_এটি একটু সময় নিবে, অপেক্ষা করুন।_", parse_mode='Markdown')
+    
     try:
         loop = asyncio.get_event_loop()
         leads = await loop.run_in_executor(None, scrape_advanced, data['loc'], data['kw'], data['count'], data.get('rating'))
+        
         if not leads:
-            return await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text="😔 কোনো result নেই।")
+            return await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text="😔 কোনো result পাওয়া যায়নি বা API Key সেট করা নেই।")
+
         path = to_csv(leads)
         em = sum(1 for l in leads if str(l.get('Email','')) not in ('N/A','','None'))
-        await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text="✅ হয়ে গেছে!")
-        with open(path,'rb') as f:
-            await ctx.bot.send_document(chat_id=q.message.chat_id, document=f, filename="leads.csv",
-                caption=f"🎯 *Done!*\n📊 Total: {len(leads)} | 📧 Emails: {em}", parse_mode='Markdown')
+        
+        await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text="✅ হয়ে গেছে! ফাইল পাঠাচ্ছি...")
+        with open(path, 'rb') as f:
+            await ctx.bot.send_document(
+                chat_id=q.message.chat_id, document=f, filename=f"leads_{data['kw'].replace(' ','_')}.csv",
+                caption=f"🎯 *Scraping Done!*\n📊 Total Leads: {len(leads)} \n📧 Emails Found: {em}", parse_mode='Markdown'
+            )
         os.unlink(path)
     except Exception as e:
-        await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text=f"❌ `{e}`", parse_mode='Markdown')
+        await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text=f"❌ Error: `{e}`", parse_mode='Markdown')
 
 def run_telegram_bot():
-    loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     app = Application.builder().token(CONFIG["TELEGRAM_TOKEN"]).build()
+    
     conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(handle_mode, pattern="^mode_")],
         states={
-            M_LOC:     [MessageHandler(filters.TEXT & ~filters.COMMAND, m_loc)],
-            M_KW:      [MessageHandler(filters.TEXT & ~filters.COMMAND, m_kw)],
-            M_COUNT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, m_count)],
-            M_RATING:  [MessageHandler(filters.TEXT & ~filters.COMMAND, m_rating)],
-            AI_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ai_prompt)],
+            M_LOC: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_loc)],
+            M_KW: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_kw)],
+            M_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_count)],
+            M_RATING: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_rating)],
+            AI_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ai_prompt)]
         },
-        fallbacks=[], per_message=False,
+        fallbacks=[],
+        per_message=False,
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(execute_scrape, pattern="^start_scrape$"))
+    
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
-# ══════════════════════════════════════════════
-#   MAIN
-# ══════════════════════════════════════════════
 if __name__ == "__main__":
     threading.Thread(target=run_telegram_bot, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
