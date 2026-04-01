@@ -98,7 +98,7 @@ def scrape_advanced(location, keyword, max_leads=50, max_rating=None, min_review
     client = ApifyClient(CONFIG["APIFY_TOKEN"])
     
     # Using the new humble_vacation email extractor actor
-    run = client.actor("humble_vacation/google-maps-email-extractor").call(run_input={
+    run = client.actor("humble_vacation/google-maps").call(run_input={
         "searchStringsArray": [f"{keyword} in {location}"],
         "maxCrawledPlacesPerSearch": int(max_leads),
         "language": "en",
