@@ -10,9 +10,14 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 )
-
-# নতুন লাইব্রেরি ইম্পোর্ট করা হলো
 from duckduckgo_search import DDGS
+
+# --- NEW REQUIREMENT ADDED: PLAYWRIGHT ---
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    sync_playwright = None
+    print("Warning: Playwright not installed. Run 'pip install playwright' and 'playwright install'")
 
 load_dotenv()
 
@@ -136,20 +141,18 @@ def _random_headers():
     }
 
 # ══════════════════════════════════════════════
-#   1. MAPS SCRAPER (UPDATED WITH PYTHON LIBRARY)
+#   1. MAPS SCRAPER (ORIGINAL DDGS BACKUP)
 # ══════════════════════════════════════════════
 class GoogleMapsScraper:
     def __init__(self):
-        self.cache = {} # Cache results to handle your existing pagination logic
+        self.cache = {} 
 
     def get_page(self, keyword, location, start):
         query = f"{keyword} {location}"
         
-        # If we haven't searched this keyword yet, fetch all results using the library
         if query not in self.cache:
             results = []
             try:
-                # Using DDGS library to get local business map results
                 with DDGS() as ddgs:
                     raw_data = list(ddgs.maps(query, max_results=150))
                     
@@ -171,8 +174,164 @@ class GoogleMapsScraper:
                 
             self.cache[query] = results
 
-        # Return chunks of 20 to perfectly match your existing master thread loop
         return self.cache[query][start:start+20]
+
+
+# ══════════════════════════════════════════════
+#   1.5. PLAYWRIGHT GOOGLE MAPS SCRAPER (NEW MODULE)
+# ══════════════════════════════════════════════
+class PlaywrightGoogleMapsScraper:
+    """
+    Drop-in replacement for the Maps scraper using Playwright automation.
+    Mimics human behavior with delays, scrolls, and extracting details.
+    """
+    def __init__(self):
+        self.cache = {}
+
+    def get_page(self, keyword, location, start):
+        """Matches the existing pagination logic signature"""
+        query = f"{keyword} {location}"
+        
+        if query not in self.cache:
+            # Fetch a robust batch to cache for this keyword
+            self.cache[query] = self.scrape_google_maps(query, max_leads=100)
+
+        # Returns chunks of 20 to keep the master thread exactly the same
+        return self.cache[query][start:start+20]
+
+    def scrape_google_maps(self, query, max_leads=20):
+        results = []
+        if not sync_playwright:
+            print("Error: Playwright module missing. Please install it.")
+            return results
+            
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True) # Run headless for server safety
+                context = browser.new_context(
+                    viewport={'width': 1280, 'height': 800},
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+                )
+                
+                # Main tab for infinite scroll list
+                page = context.new_page()
+                page.goto("https://www.google.com/maps", timeout=60000)
+
+                # Wait for search box & enter query
+                page.wait_for_selector('input#searchboxinput', timeout=15000)
+                page.fill('input#searchboxinput', query)
+                page.keyboard.press("Enter")
+                
+                # Wait for the left results panel to load
+                page.wait_for_selector('a[href*="https://www.google.com/maps/place/"]', timeout=20000)
+
+                seen_urls = set()
+                
+                # Secondary tab for extracting business details (so we don't break the feed state)
+                details_page = context.new_page()
+                
+                scroll_attempts = 0
+                max_scroll_attempts = 30
+                
+                while len(results) < max_leads and scroll_attempts < max_scroll_attempts:
+                    page.wait_for_timeout(2000) # Give DOM time to update after scroll
+                    listings = page.locator('a[href*="https://www.google.com/maps/place/"]').all()
+                    
+                    for listing in listings:
+                        if len(results) >= max_leads:
+                            break
+                        
+                        try:
+                            url = listing.get_attribute('href')
+                            if not url or url in seen_urls:
+                                continue
+                                
+                            seen_urls.add(url)
+                            
+                            # Navigate secondary page to business listing
+                            try:
+                                details_page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                                details_page.wait_for_timeout(1000) # Human-like delay
+                            except Exception as e:
+                                continue
+                            
+                            # --- Extract Data Silently Using robust locators ---
+                            name = "N/A"
+                            try:
+                                h1_loc = details_page.locator('h1')
+                                if h1_loc.count() > 0:
+                                    name = h1_loc.first.inner_text().strip()
+                                else:
+                                    name = listing.get_attribute('aria-label') or "N/A"
+                            except: pass
+                            
+                            address = "N/A"
+                            try:
+                                addr_loc = details_page.locator('button[data-item-id="address"]')
+                                if addr_loc.count() > 0:
+                                    address = addr_loc.first.inner_text().strip()
+                            except: pass
+                            
+                            phone = "N/A"
+                            try:
+                                phone_loc = details_page.locator('button[data-item-id^="phone:tel:"]')
+                                if phone_loc.count() > 0:
+                                    phone = phone_loc.first.inner_text().replace('\n', '').strip()
+                            except: pass
+                            
+                            website = "N/A"
+                            try:
+                                web_loc = details_page.locator('a[data-item-id="authority"]')
+                                if web_loc.count() > 0:
+                                    website = web_loc.first.get_attribute('href')
+                            except: pass
+                            
+                            rating = "N/A"
+                            try:
+                                rating_loc = details_page.locator('div[aria-label*="stars"], span[aria-label*="stars"]')
+                                if rating_loc.count() > 0:
+                                    r_text = rating_loc.first.get_attribute('aria-label')
+                                    match = re.search(r'([\d\.]+)', str(r_text))
+                                    if match:
+                                        rating = match.group(1)
+                            except: pass
+                            
+                            if name and name != "N/A":
+                                results.append({
+                                    "Name": name,
+                                    "Phone": phone,
+                                    "Website": website,
+                                    "Rating": rating,
+                                    "Address": address,
+                                    "Category": query,
+                                    "Maps_Link": url
+                                })
+                        except Exception as inner_e:
+                            continue # Ignore missing elements and keep scraping
+                    
+                    if len(results) >= max_leads:
+                        break
+                        
+                    # --- Infinite Scroll Logic ---
+                    try:
+                        feed_locator = page.locator('div[role="feed"]')
+                        if feed_locator.count() > 0:
+                            feed_locator.evaluate("el => el.scrollTo(0, el.scrollHeight)")
+                        else:
+                            # Fallback Mouse Wheel Scroll
+                            page.mouse.move(300, 400)
+                            page.mouse.wheel(0, 5000)
+                    except Exception:
+                        pass
+                    
+                    scroll_attempts += 1
+                    
+                browser.close()
+        except Exception as e:
+            print(f"Playwright Execution Engine Error: {e}")
+            
+        return results
+
 
 # ══════════════════════════════════════════════
 #   2. DEEP EMAIL EXTRACTOR LIBRARY
@@ -265,7 +424,10 @@ def run_job_thread(job_id, data):
         webhook_url = data.get('webhook_url')
         templates = data.get('templates', [])
         
-        maps_lib = GoogleMapsScraper()
+        # --- MODIFIED: Using the new Playwright module ---
+        maps_lib = PlaywrightGoogleMapsScraper()
+        # maps_lib = GoogleMapsScraper() # (Old DDGS version kept as backup)
+
         email_lib = DeepEmailExtractor()
         
         final_leads = []
@@ -818,7 +980,9 @@ async def background_bot_task(chat_id, message_id, data, bot):
         loop = asyncio.get_event_loop()
         await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="⏳ *Scraping & Deep Email Extraction running...*\n_AI will auto-expand keywords until target is reached._", parse_mode='Markdown')
         
-        maps_lib = GoogleMapsScraper()
+        # --- MODIFIED: Using the new Playwright module ---
+        maps_lib = PlaywrightGoogleMapsScraper()
+        
         email_lib = DeepEmailExtractor()
         final_leads = []
         seen_names = set()
@@ -839,6 +1003,7 @@ async def background_bot_task(chat_id, message_id, data, bot):
             start = 0
             empty_strikes = 0
             while start <= 300 and len(final_leads) < max_leads:
+                # Execution takes place safely within the executor
                 raw_batch = await loop.run_in_executor(None, maps_lib.get_page, current_kw, data['loc'], start)
                 if not raw_batch:
                     empty_strikes += 1
