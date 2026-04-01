@@ -18,56 +18,59 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+def get_headers():
+    HEADERS_LIST = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/118.0.0.0 Safari/537.36",
+    ]
+    return {
+        "User-Agent": random.choice(HEADERS_LIST),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Referer": "https://www.google.com/",
+    }
+
 # ══════════════════════════════════════════════
-#   1. PURE PYTHON GOOGLE MAPS LIBRARY (100% ORIGINAL RESTORED)
+#   1. PURE PYTHON GOOGLE MAPS LIBRARY (RESTORED FROM FILE 2)
 # ══════════════════════════════════════════════
 class GoogleMapsScraper:
-    def __init__(self):
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9"
-        }
-
     def get_page(self, keyword, location, start):
         results = []
-        query = urllib.parse.quote(f"{keyword} in {location}")
-        url = f"https://www.google.com/search?q={query}&tbm=lcl&start={start}"
+        query = urllib.parse.quote_plus(f"{keyword} in {location}")
+        url = f"https://www.google.com/search?q={query}&tbm=lcl&start={start}&num=20&hl=en"
         
         try:
-            res = requests.get(url, headers=self.headers, timeout=15)
+            res = requests.get(url, headers=get_headers(), timeout=15)
             soup = BeautifulSoup(res.text, 'html.parser')
             
-            # Find all business blocks exactly like your original working code
-            places = soup.find_all('div', class_=['VkpGBb', 'rllt__details', 'dbg0pd'])
-            
-            if not places: 
-                return []
+            # Phase 1: Local Search Selectors
+            blocks = soup.select('div.VkpGBb, div.rllt__details, div[jscontroller]')
+            if not blocks:
+                blocks = soup.select('div.uMdZh, div.cXedhc')
                 
-            for place in places:
-                name_tag = place.find(['div', 'h3', 'span'], class_='dbg0pd') or place.find('div', role='heading')
-                name = name_tag.get_text(strip=True) if name_tag else "N/A"
+            for block in blocks:
+                text_content = block.get_text(separator=' ', strip=True)
                 
-                if name == "N/A" or len(name) < 3: 
-                    continue
+                name_el = block.select_one('div[role="heading"], .dbg0pd, span.OSrXXb')
+                name = name_el.get_text(strip=True) if name_el else "N/A"
+                if name == "N/A" or len(name) < 3: continue
                     
-                text_content = place.get_text(separator=' ', strip=True)
-                
-                # Robust Rating Extraction
-                rating_match = re.search(r'(\d[\.,]\d)\s*(?:\(|stars|reviews)', text_content)
+                rating_match = re.search(r'(\d[\.,]\d)\s*[\(\d]', text_content)
                 rating = rating_match.group(1).replace(',', '.') if rating_match else "N/A"
                 
-                phone_match = re.search(r'(\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}', text_content)
-                phone = phone_match.group(0) if phone_match else "N/A"
+                ph = re.search(r'(\+?1?\s?[\(\-]?\d{3}[\)\-\s]?\s?\d{3}[\-\s]?\d{4}|\+?880[\s\-]?\d{2}[\s\-]?\d{8}|\+?8801[3-9]\d{8}|01[3-9]\d{8})', text_content)
+                phone = ph.group(0).strip() if ph else "N/A"
                 
                 website = "N/A"
-                for a in place.find_all('a', href=True):
+                for a in block.select('a[href]'):
                     href = a['href']
-                    if '/url?q=' in href and 'google.com' not in href:
-                        website = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
-                        break
-                    elif href.startswith('http') and 'google.com' not in href:
-                        website = href
-                        break
+                    if '/url?q=' in href:
+                        clean = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
+                        if 'google' not in clean.lower() and clean.startswith('http'):
+                            website = clean; break
+                    elif href.startswith('http') and 'google' not in href.lower():
+                        website = href; break
                         
                 results.append({
                     "Name": name,
@@ -76,35 +79,69 @@ class GoogleMapsScraper:
                     "Rating": rating,
                     "Address": location,
                     "Category": keyword,
-                    "Maps_Link": f"https://www.google.com/maps/search/{urllib.parse.quote(name + ' ' + location)}"
+                    "Maps_Link": f"https://www.google.com/maps/search/{urllib.parse.quote_plus(name + ' ' + location)}"
                 })
         except Exception as e:
             pass
             
+        # Phase 2: Fallback to Maps JSON if Phase 1 fails completely on the first page
+        if not results and start == 0:
+            results = self._phase2_search(keyword, location)
+            
+        return results
+
+    def _phase2_search(self, keyword, location):
+        results = []
+        query = urllib.parse.quote_plus(f"{keyword} {location}")
+        url = f"https://www.google.com/maps/search/{query}"
+        try:
+            r = requests.get(url, headers=get_headers(), timeout=15)
+            text = r.text
+            names = re.findall(r'"([^"]{3,60})"(?:,null){0,3},"[^"]*","[^"]*"', text)
+            phones = re.findall(r'(\+?1?\s?[\(\-]?\d{3}[\)\-\s]?\s?\d{3}[\-\s]?\d{4})', text)
+            websites = re.findall(r'https?://(?!(?:www\.google|maps\.google|goo\.gl|googleapis|facebook|instagram|twitter))[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}(?:/[^\s"\'<>]*)?', text)
+            ratings = re.findall(r'"(\d\.\d)"', text)
+            
+            websites = list(dict.fromkeys(w for w in websites if 'google' not in w.lower()))
+            
+            seen = set()
+            for i, name in enumerate(names[:20]):
+                if name in seen: continue
+                seen.add(name)
+                website = websites[i] if i < len(websites) else 'N/A'
+                results.append({
+                    'Name': name,
+                    'Phone': phones[i] if i < len(phones) else 'N/A',
+                    'Website': website,
+                    'Rating': ratings[i] if i < len(ratings) else 'N/A',
+                    'Address': location,
+                    'Category': keyword,
+                    'Maps_Link': 'N/A'
+                })
+        except: pass
         return results
 
 # ══════════════════════════════════════════════
-#   2. DEEP EMAIL EXTRACTOR LIBRARY (100% ORIGINAL RESTORED)
+#   2. DEEP EMAIL EXTRACTOR LIBRARY
 # ══════════════════════════════════════════════
 class DeepEmailExtractor:
     def __init__(self):
-        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         self.email_regex = r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
 
     def get_email(self, url):
         if not url or url == "N/A": return "N/A"
         if not url.startswith('http'): url = 'http://' + url
         try:
-            r = requests.get(url, headers=self.headers, timeout=8, verify=False)
+            r = requests.get(url, headers=get_headers(), timeout=8, verify=False)
             emails = list(set(re.findall(self.email_regex, r.text)))
             valid = [e for e in emails if not any(x in e.lower() for x in ['example','domain','sentry','@2x','.png','.jpg','wixpress'])]
             if valid: return valid[0]
             
             soup = BeautifulSoup(r.text, 'html.parser')
-            for a in soup.find_all('a', href=True):
+            for a in soup.select('a[href]'):
                 if 'contact' in a.get('href', '').lower():
                     clink = urllib.parse.urljoin(url, a['href'])
-                    r2 = requests.get(clink, headers=self.headers, timeout=8, verify=False)
+                    r2 = requests.get(clink, headers=get_headers(), timeout=8, verify=False)
                     emails2 = list(set(re.findall(self.email_regex, r2.text)))
                     valid2 = [e for e in emails2 if not any(x in e.lower() for x in ['example','domain','sentry','@2x','.png','.jpg'])]
                     if valid2: return valid2[0]
@@ -195,11 +232,11 @@ def run_job_thread(job_id, data):
             used_keywords.add(current_kw.lower())
             kw_attempts += 1
             
-            jobs[job_id]['status_text'] = f"Scraping keyword: '{current_kw}'..."
             start = 0
             empty_strikes = 0
             
             while start <= 300 and len(final_leads) < max_leads:
+                jobs[job_id]['status_text'] = f"Found {len(final_leads)}/{max_leads} valid emails... (Searching: {current_kw})"
                 raw_batch = maps_lib.get_page(current_kw, location, start)
                 
                 if not raw_batch:
@@ -211,6 +248,9 @@ def run_job_thread(job_id, data):
                 for lead in raw_batch:
                     if len(final_leads) >= max_leads: break
                     if lead['Name'] in seen_names: continue
+                    
+                    # LIVE UI UPDATE: Show exactly which company is being checked right now
+                    jobs[job_id]['status_text'] = f"Found {len(final_leads)}/{max_leads} valid emails... (Checking: {lead['Name']})"
                     
                     # Rating Filter (Bad Reviews)
                     if max_rating and lead['Rating'] != "N/A":
@@ -229,7 +269,6 @@ def run_job_thread(job_id, data):
                     
                     jobs[job_id]['count'] = len(final_leads)
                     jobs[job_id]['leads'] = final_leads # Update live for UI
-                    jobs[job_id]['status_text'] = f"Found {len(final_leads)}/{max_leads} valid emails... (Searching: {current_kw})"
                         
                 start += 20
                 time.sleep(1.5)
@@ -590,20 +629,25 @@ async function startJob(){
             
             if(d2.status==='scraping'){
                 setSt(d2.status_text, 'load', Math.max(5, (d2.count/count)*100));
+                // Update live UI if leads are found
+                if(d2.leads && d2.leads.length > 0) {
+                    updStats(d2.leads);
+                    if(!tableShown) { showPV(d2.leads); tableShown=true; }
+                }
                 setTimeout(poll, 3000);
             }
             else if(d2.status==='sending_emails'){
                 if(!tableShown && d2.leads) {
                     updStats(d2.leads); showPV(d2.leads); tableShown = true;
-                    document.getElementById('dlbtn').classList.remove('hidden');
                 }
+                document.getElementById('dlbtn').classList.remove('hidden');
                 let emailPct = (d2.emails_sent / d2.total_to_send) * 100;
                 setSt(d2.status_text, 'email', Math.max(5, emailPct));
                 setTimeout(poll, 3000);
             }
             else if(d2.status==='done'){
               document.getElementById('btn-run').disabled=false;
-              if(!tableShown && d2.leads) { updStats(d2.leads); showPV(d2.leads); }
+              if(d2.leads) { updStats(d2.leads); showPV(d2.leads); }
               setSt(d2.status_text, 'done', 100);
               document.getElementById('dlbtn').classList.remove('hidden');
             } 
