@@ -56,7 +56,7 @@ def parse_with_ai(user_text):
         return json.loads(response)
     except Exception as e:
         print(f"Groq Error: {e}")
-        return None
+        raise Exception("Failed to connect to Groq AI. Please check your API Key in Settings.")
 
 # ══════════════════════════════════════════════
 #   DEEP EMAIL EXTRACTOR (PYTHON FALLBACK)
@@ -89,7 +89,7 @@ def extract_email_from_website(url):
     return "N/A"
 
 # ══════════════════════════════════════════════
-#   ADVANCED SCRAPER (HUMBLE VACATION ACTOR)
+#   ADVANCED SCRAPER (HUMBLE VACATION TASK)
 # ══════════════════════════════════════════════
 def scrape_advanced(location, keyword, max_leads=50, max_rating=None, min_reviews=None):
     if not CONFIG["APIFY_TOKEN"]:
@@ -97,30 +97,30 @@ def scrape_advanced(location, keyword, max_leads=50, max_rating=None, min_review
         
     client = ApifyClient(CONFIG["APIFY_TOKEN"])
     
-    # Using the new humble_vacation email extractor actor
-    run = client.actor("humble_vacation/google-maps").call(run_input={
-        "searchStringsArray": [f"{keyword} in {location}"],
-        "maxCrawledPlacesPerSearch": int(max_leads),
-        "language": "en",
-    })
+    # FIX: Using client.task() instead of client.actor() because of "-task" in the name
+    try:
+        run = client.task("humble_vacation/google-maps-email-task").call(run_input={
+            "searchStringsArray": [f"{keyword} in {location}"],
+            "maxCrawledPlacesPerSearch": int(max_leads),
+            "language": "en",
+        })
+    except Exception as e:
+        raise Exception(f"Apify Error: {str(e)}. Please check if the Task name is correct in your Apify account.")
     
     leads = []
     for item in client.dataset(run["defaultDatasetId"]).iterate_items():
         rating = item.get("totalScore", 0)
         reviews = item.get("reviewsCount", 0)
         
-        # Apply Filters
         if max_rating and rating and float(rating) > float(max_rating): continue
         if min_reviews and reviews and int(reviews) < int(min_reviews): continue
         
         website = item.get("website", "N/A")
         
-        # 1. Try to get email from Apify's new actor
         email = item.get("email") or item.get("emails", [])
         if isinstance(email, list) and len(email) > 0:
-            email = email[0] # Take the first email if it returns a list
+            email = email[0]
             
-        # 2. If Apify fails, use our Python Deep Extractor as a backup!
         if (not email or email == "N/A") and website != "N/A":
             email = extract_email_from_website(website)
             time.sleep(0.5) 
@@ -233,6 +233,7 @@ HTML_TEMPLATE = """
                 <div>
                     <label class="block text-sm font-medium mb-2 text-gray-400">Groq API Key (For AI Brain)</label>
                     <input id="groq-key" type="password" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="Enter Groq API Key">
+                    <p class="text-xs text-gray-400 mt-2">Get your free key from <a href="https://console.groq.com/keys" target="_blank" class="text-indigo-400 underline">console.groq.com</a></p>
                 </div>
                 <button onclick="saveSettings()" class="w-full bg-gradient-to-r from-blue-500 to-indigo-600 text-white font-bold py-3 rounded-xl shadow-lg hover:shadow-xl transition">Save Settings</button>
             </div>
@@ -366,7 +367,7 @@ HTML_TEMPLATE = """
                 document.getElementById('typing-indicator').remove();
 
                 if(data.error) {
-                    addMsg("Error: " + data.error, true);
+                    addMsg(data.error, true);
                     return;
                 }
 
@@ -386,7 +387,7 @@ HTML_TEMPLATE = """
                 }
             } catch (err) {
                 document.getElementById('typing-indicator').remove();
-                addMsg("Sorry, I couldn't process that. Make sure Groq API key is added in Settings.", true);
+                addMsg("Error communicating with server.", true);
             }
         }
     </script>
@@ -411,10 +412,13 @@ def handle_chat():
     if text.lower() in ['yes', 'start', 'do it', 'go']:
         return jsonify({"ready": True, "state": request.json.get('state')})
 
-    parsed = parse_with_ai(text)
+    try:
+        parsed = parse_with_ai(text)
+    except Exception as e:
+        return jsonify({"error": str(e)})
     
     if not parsed:
-        return jsonify({"error": "Failed to connect to Groq AI. Check API Key in settings."})
+        return jsonify({"error": "Failed to parse input. Try again."})
 
     state = request.json.get('state', {})
     if parsed.get('loc'): state['loc'] = parsed['loc']
@@ -471,7 +475,7 @@ def download(job_id):
     return send_file(io.BytesIO(out.getvalue().encode('utf-8-sig')), mimetype='text/csv', as_attachment=True, download_name='advanced_leads.csv')
 
 # ══════════════════════════════════════════════
-#   TELEGRAM BOT (MANUAL & AI)
+#   TELEGRAM BOT
 # ══════════════════════════════════════════════
 def to_csv(leads):
     tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8-sig', newline='')
@@ -531,27 +535,27 @@ async def ai_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     msg = await update.message.reply_text("🤖 _Thinking..._", parse_mode='Markdown')
     
-    parsed = parse_with_ai(text)
-    if not parsed:
-        await msg.edit_text("❌ Error connecting to Groq AI. Please check API Key.")
+    try:
+        parsed = parse_with_ai(text)
+        if not parsed.get('loc') or not parsed.get('kw'):
+            await msg.edit_text("🤖 আমি ঠিক বুঝতে পারিনি। দয়া করে Keyword এবং Location পরিষ্কার করে বলো।")
+            return AI_PROMPT
+            
+        bot_store[uid] = {
+            'loc': parsed['loc'],
+            'kw': parsed['kw'],
+            'count': parsed.get('count', 50),
+            'rating': parsed.get('rating')
+        }
+        await msg.delete()
+        return await ask_confirm(update, uid)
+    except Exception as e:
+        await msg.edit_text(f"❌ {str(e)}")
         return AI_PROMPT
-        
-    if not parsed.get('loc') or not parsed.get('kw'):
-        await msg.edit_text("🤖 আমি ঠিক বুঝতে পারিনি। দয়া করে Keyword এবং Location পরিষ্কার করে বলো।")
-        return AI_PROMPT
-        
-    bot_store[uid] = {
-        'loc': parsed['loc'],
-        'kw': parsed['kw'],
-        'count': parsed.get('count', 50),
-        'rating': parsed.get('rating')
-    }
-    await msg.delete()
-    return await ask_confirm(update, uid)
 
 async def ask_confirm(update, uid):
     data = bot_store[uid]
-    txt = f"📋 *Summary (Groq AI)*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Leads: {data['count']}\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nশুরু করবো?"
+    txt = f"📋 *Summary*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Leads: {data['count']}\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nশুরু করবো?"
     kb = [[InlineKeyboardButton("✅ Start Automation", callback_data="start_scrape")]]
     await update.message.reply_text(txt, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
