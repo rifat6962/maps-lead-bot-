@@ -19,12 +19,13 @@ CONFIG = {
 }
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://duckduckgo.com/"
 }
 
 # ══════════════════════════════════════════════
-#   GROQ AI BRAIN (NATURAL LANGUAGE PARSER)
+#   GROQ AI BRAIN
 # ══════════════════════════════════════════════
 def parse_with_ai(user_text):
     if not CONFIG["GROQ_API_KEY"]:
@@ -32,17 +33,17 @@ def parse_with_ai(user_text):
     
     client = Groq(api_key=CONFIG["GROQ_API_KEY"])
     prompt = f"""
-    You are an AI assistant for a Google Maps Lead Generation tool.
+    You are an AI assistant for a Lead Generation tool.
     Extract the following details from the user's input:
-    - loc: The location (e.g., Canada, Dhaka, Texas)
+    - loc: The location (e.g., Toronto, Dhaka, Texas)
     - kw: The niche or keyword (e.g., car showroom, plumber)
-    - count: Number of leads requested (integer, default is 50)
+    - count: Number of leads requested (integer, default is 100)
     - rating: Maximum rating requested (float, e.g., 3.0, 4.5)
 
     User input: "{user_text}"
 
     Return ONLY a valid JSON object. Do not include any other text.
-    Example format: {{"loc": "Canada", "kw": "car showroom", "count": 50, "rating": 3.0}}
+    Example format: {{"loc": "Toronto", "kw": "car showroom", "count": 100, "rating": 3.0}}
     """
     
     try:
@@ -67,10 +68,8 @@ EMAIL_REGEX = r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
 def extract_email_from_website(url):
     if not url or url == "N/A": return "N/A"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=8)
+        r = requests.get(url, headers=HEADERS, timeout=5)
         emails = list(set(re.findall(EMAIL_REGEX, r.text)))
-        
-        # Filter out dummy emails
         valid_emails = [e for e in emails if not any(x in e.lower() for x in ['example', 'domain', 'sentry', '@2x', '.png', '.jpg'])]
         if valid_emails: return valid_emails[0]
         
@@ -83,95 +82,73 @@ def extract_email_from_website(url):
         
         if contact_link:
             if not contact_link.startswith('http'):
-                contact_link = url.rstrip('/') + '/' + contact_link.lstrip('/')
-            r2 = requests.get(contact_link, headers=HEADERS, timeout=8)
+                contact_link = urllib.parse.urljoin(url, contact_link)
+            r2 = requests.get(contact_link, headers=HEADERS, timeout=5)
             emails2 = list(set(re.findall(EMAIL_REGEX, r2.text)))
-            valid_emails2 = [e for e in emails2 if not any(x in e.lower() for x in ['example', 'domain', 'sentry', '@2x'])]
+            valid_emails2 = [e for e in emails2 if not any(x in e.lower() for x in ['example', 'domain', 'sentry', '@2x', '.png', '.jpg'])]
             if valid_emails2: return valid_emails2[0]
     except:
         pass
     return "N/A"
 
 # ══════════════════════════════════════════════
-#   100% FREE CUSTOM SCRAPER
+#   100% FREE ANTI-BLOCK SCRAPER (DDG LOCAL)
 # ══════════════════════════════════════════════
-def scrape_free(location, keyword, max_leads=50, max_rating=None):
+def scrape_free(location, keyword, max_leads=100, max_rating=None):
     results = []
     query = f"{keyword} in {location}"
-    encoded = urllib.parse.quote(query)
-    
-    # 1. Scrape Google Search Local Pack (Fallback Method)
-    url = f"https://www.google.com/search?q={encoded}&num=30"
     
     try:
-        response = requests.get(url, headers=HEADERS, timeout=15)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Find business blocks
-        for div in soup.find_all('div', class_=['VkpGBb', 'rllt__details', 'dbg0pd']):
-            try:
-                name_el = div.find(['h3', 'span', 'a'])
-                name = name_el.get_text(strip=True) if name_el else 'N/A'
+        # 1. Get VQD Token (Required for DDG API)
+        html_res = requests.get(f"https://duckduckgo.com/?q={urllib.parse.quote(query)}&t=h_&ia=web", headers=HEADERS, timeout=10)
+        vqd_match = re.search(r'vqd=([\d-]+)', html_res.text)
+        if not vqd_match:
+            vqd_match = re.search(r'vqd["\']?\s*:\s*["\']([^"\']+)["\']', html_res.text)
+        vqd = vqd_match.group(1) if vqd_match else ""
+
+        # 2. Fetch Local JSON Data (Pagination via 's' parameter)
+        for skip in range(0, int(max_leads), 20):
+            url = f"https://duckduckgo.com/local.js?l=us-en&q={urllib.parse.quote(query)}&vqd={vqd}&s={skip}"
+            res = requests.get(url, headers=HEADERS, timeout=10)
+            data = res.json()
+            
+            if "results" not in data or not data["results"]:
+                break
                 
-                text = div.get_text(separator=' ', strip=True)
+            for item in data["results"]:
+                name = item.get("name", "N/A")
+                if name == "N/A": continue
                 
-                # Extract Phone
-                phone_match = re.search(r'(\+?8801[3-9]\d{8}|01[3-9]\d{8}|\+?\d[\d\s\-\(\)]{8,})', text)
-                phone = phone_match.group(1).strip() if phone_match else 'N/A'
-                
-                # Extract Rating
-                rating_match = re.search(r'(\d\.\d)\s*\(', text)
-                rating = rating_match.group(1) if rating_match else "N/A"
-                
-                # Filter by Rating
+                rating = str(item.get("rating", "N/A"))
                 if max_rating and rating != "N/A" and float(rating) > float(max_rating):
                     continue
-                
-                # Extract Website Link
-                website = "N/A"
-                for a in div.find_all('a', href=True):
-                    if 'url?q=' in a['href'] and 'google.com' not in a['href']:
-                        website = a['href'].split('url?q=')[1].split('&')[0]
-                        break
-                    elif a['href'].startswith('http') and 'google.com' not in a['href']:
-                        website = a['href']
-                        break
+                    
+                website = item.get("website", "N/A")
+                email = "N/A"
                 
                 # Deep Email Extract
-                email = "N/A"
-                if website != "N/A":
+                if website != "N/A" and website.startswith("http"):
                     email = extract_email_from_website(website)
-                    time.sleep(0.5)
-                
-                if name and name != 'N/A':
-                    results.append({
-                        "Name": name,
-                        "Phone": phone,
-                        "Email": email,
-                        "Address": "N/A",
-                        "Category": keyword,
-                        "Rating": rating,
-                        "Reviews": "N/A",
-                        "Website": website,
-                        "Maps_Link": f"https://www.google.com/maps/search/{urllib.parse.quote(name + ' ' + location)}"
-                    })
+                    time.sleep(0.5) # Anti-ban delay
                     
+                results.append({
+                    "Name": name,
+                    "Phone": item.get("phone", "N/A"),
+                    "Email": email,
+                    "Address": item.get("address", "N/A"),
+                    "Category": keyword,
+                    "Rating": rating,
+                    "Reviews": item.get("reviews", "N/A"),
+                    "Website": website,
+                    "Maps_Link": f"https://www.google.com/maps/search/{urllib.parse.quote(name + ' ' + item.get('address', location))}"
+                })
+                
                 if len(results) >= int(max_leads):
-                    break
-            except Exception:
-                continue
+                    return results
     except Exception as e:
-        print(f"Search API error: {e}")
+        print(f"Scraper Error: {e}")
 
-    # Remove duplicates
-    seen = set()
-    unique_results = []
-    for r in results:
-        if r['Name'] not in seen:
-            seen.add(r['Name'])
-            unique_results.append(r)
-
-    return unique_results[:int(max_leads)]
+    return results
 
 # ══════════════════════════════════════════════
 #   WEB DASHBOARD (FLASK + DARK TAILWIND CSS)
@@ -217,7 +194,7 @@ HTML_TEMPLATE = """
                 <div class="bg-gradient-to-br from-indigo-500 to-purple-600 text-white p-3 rounded-xl shadow-lg"><i class="fa-solid fa-map-location-dot text-2xl"></i></div>
                 <div>
                     <h1 class="text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-purple-400">LeadGen Pro</h1>
-                    <span class="text-xs font-bold bg-green-500 text-white px-2 py-1 rounded-full">100% Free Edition</span>
+                    <span class="text-xs font-bold bg-green-500 text-white px-2 py-1 rounded-full">100% Free Anti-Block Edition</span>
                 </div>
             </div>
             <button onclick="switchTab('settings')" class="text-gray-400 hover:text-white transition bg-gray-800 p-3 rounded-xl border border-gray-700"><i class="fa-solid fa-gear text-xl"></i></button>
@@ -232,10 +209,13 @@ HTML_TEMPLATE = """
         <!-- Manual Tab -->
         <div id="content-manual" class="bg-darkcard p-8 rounded-2xl shadow-xl border border-gray-800">
             <h2 class="text-2xl font-bold mb-6 text-white flex items-center gap-2"><i class="fa-solid fa-sliders text-indigo-400"></i> Manual Parameters</h2>
+            <div class="bg-blue-900/30 border border-blue-500/50 p-4 rounded-xl text-blue-400 mb-6 text-sm">
+                <i class="fa-solid fa-circle-info mr-2"></i> <b>Pro Tip:</b> For thousands of leads, search by specific cities (e.g., "Toronto", "Vancouver") instead of whole countries ("Canada").
+            </div>
             <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
-                <div><label class="block text-sm font-medium mb-2 text-gray-400">Location *</label><input id="m-loc" type="text" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., New York, NY"></div>
-                <div><label class="block text-sm font-medium mb-2 text-gray-400">Keyword *</label><input id="m-kw" type="text" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., Real Estate Agency"></div>
-                <div><label class="block text-sm font-medium mb-2 text-gray-400">Number of Leads (Max 30 for Free)</label><input id="m-count" type="number" value="30" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none"></div>
+                <div><label class="block text-sm font-medium mb-2 text-gray-400">Location (City Recommended) *</label><input id="m-loc" type="text" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., Toronto"></div>
+                <div><label class="block text-sm font-medium mb-2 text-gray-400">Keyword *</label><input id="m-kw" type="text" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., Car Showroom"></div>
+                <div><label class="block text-sm font-medium mb-2 text-gray-400">Number of Leads (Max 500)</label><input id="m-count" type="number" value="100" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none"></div>
                 <div><label class="block text-sm font-medium mb-2 text-gray-400">Max Rating (Optional)</label><input id="m-rating" type="number" step="0.1" class="w-full bg-darkinput border border-gray-600 rounded-xl p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none" placeholder="e.g., 4.5"></div>
             </div>
             <button onclick="startManual()" id="btn-manual" class="w-full bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 text-white font-bold py-4 rounded-xl shadow-lg transition text-lg"><i class="fa-solid fa-rocket mr-2"></i> Start Scraping</button>
@@ -250,7 +230,7 @@ HTML_TEMPLATE = """
                 <div class="flex gap-4">
                     <div class="bg-darkcard border border-gray-700 text-gray-200 p-4 rounded-2xl rounded-tl-none max-w-[85%] shadow-md">
                         Hello! I am your AI Agent powered by Groq. Tell me exactly what you need in plain English.<br><br>
-                        <span class="text-indigo-400 italic">Example: "I need 30 leads for car showrooms in Canada with maximum 3 star rating."</span>
+                        <span class="text-indigo-400 italic">Example: "I need 100 leads for car showrooms in Toronto with maximum 3 star rating."</span>
                     </div>
                 </div>
             </div>
@@ -265,7 +245,7 @@ HTML_TEMPLATE = """
             <h2 class="text-2xl font-bold mb-6 text-white flex items-center gap-2"><i class="fa-solid fa-key text-yellow-500"></i> API Settings</h2>
             <div class="space-y-6">
                 <div class="bg-green-900/30 border border-green-500/50 p-4 rounded-xl text-green-400 mb-4">
-                    <i class="fa-solid fa-check-circle mr-2"></i> Apify is removed! The scraper is now 100% Free.
+                    <i class="fa-solid fa-check-circle mr-2"></i> Apify is removed! The scraper is now 100% Free and Anti-Block.
                 </div>
                 <div>
                     <label class="block text-sm font-medium mb-2 text-gray-400">Groq API Key (For AI Brain)</label>
@@ -327,7 +307,7 @@ HTML_TEMPLATE = """
         }
 
         async function startJob(payload) {
-            showStatus('Scraping data & extracting deep emails (100% Free)...');
+            showStatus('Scraping data & extracting deep emails (Anti-Block Mode)...');
             const res = await fetch('/api/scrape', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
             const data = await res.json();
             if(data.error) return showStatus(data.error, false, true);
@@ -343,7 +323,7 @@ HTML_TEMPLATE = """
             
             startJob({
                 location: loc, keyword: kw,
-                max_leads: document.getElementById('m-count').value || 30,
+                max_leads: document.getElementById('m-count').value || 100,
                 max_rating: document.getElementById('m-rating').value || null
             });
         }
@@ -352,10 +332,14 @@ HTML_TEMPLATE = """
             const res = await fetch('/api/status/' + currentJob);
             const data = await res.json();
             if(data.status === 'done') {
-                showStatus(`Success! Found ${data.count} leads.`, false, false);
-                const btn = document.getElementById('dl-btn');
-                btn.classList.remove('hidden');
-                btn.onclick = () => window.location = '/api/download/' + currentJob;
+                if(data.count === 0) {
+                    showStatus(`0 leads found. Try a specific city name instead of a country.`, false, true);
+                } else {
+                    showStatus(`Success! Found ${data.count} leads.`, false, false);
+                    const btn = document.getElementById('dl-btn');
+                    btn.classList.remove('hidden');
+                    btn.onclick = () => window.location = '/api/download/' + currentJob;
+                }
             } else if(data.status === 'error') {
                 showStatus('Error: ' + data.error, false, true);
             } else {
@@ -475,7 +459,7 @@ def run_scrape_thread(job_id, data):
         leads = scrape_free(
             data.get('location'), 
             data.get('keyword'),
-            data.get('max_leads', 30),
+            data.get('max_leads', 100),
             data.get('max_rating')
         )
         jobs[job_id] = {'status': 'done', 'leads': leads, 'count': len(leads)}
@@ -515,9 +499,10 @@ def download(job_id):
 # ══════════════════════════════════════════════
 def to_csv(leads):
     tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8-sig', newline='')
-    writer = csv.DictWriter(tmp, fieldnames=leads[0].keys())
-    writer.writeheader()
-    writer.writerows(leads)
+    if leads:
+        writer = csv.DictWriter(tmp, fieldnames=leads[0].keys())
+        writer.writeheader()
+        writer.writerows(leads)
     tmp.close()
     return tmp.name
 
@@ -529,7 +514,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🛠️ Manual Search", callback_data="mode_manual")],
         [InlineKeyboardButton("🤖 Groq AI Search", callback_data="mode_ai")]
     ]
-    await update.message.reply_text("👋 *Pro Lead Gen Bot (100% Free)*\n\nকীভাবে সার্চ করতে চাও?", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("👋 *Pro Lead Gen Bot (100% Free Anti-Block)*\n\nকীভাবে সার্চ করতে চাও?", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
 
 async def handle_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -538,10 +523,10 @@ async def handle_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot_store[uid] = {}
     
     if q.data == "mode_manual":
-        await q.edit_message_text("📍 *Manual Mode*\nLocation দাও (e.g. Dhaka):", parse_mode='Markdown')
+        await q.edit_message_text("📍 *Manual Mode*\nLocation দাও (e.g. Toronto):", parse_mode='Markdown')
         return M_LOC
     else:
-        await q.edit_message_text("🤖 *Groq AI Mode*\nআমাকে ইংরেজিতে বলো তুমি কী খুঁজছো।\n\n_Example: I need 30 leads for car showrooms in Canada with maximum 3 star rating_", parse_mode='Markdown')
+        await q.edit_message_text("🤖 *Groq AI Mode*\nআমাকে ইংরেজিতে বলো তুমি কী খুঁজছো।\n\n_Example: I need 100 leads for car showrooms in Toronto with maximum 3 star rating_", parse_mode='Markdown')
         return AI_PROMPT
 
 async def m_loc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -551,7 +536,7 @@ async def m_loc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def m_kw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bot_store[update.message.from_user.id]['kw'] = update.message.text
-    await update.message.reply_text("🔢 কয়টা লিড লাগবে? (Max 30):")
+    await update.message.reply_text("🔢 কয়টা লিড লাগবে? (Max 500):")
     return M_COUNT
 
 async def m_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -580,7 +565,7 @@ async def ai_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bot_store[uid] = {
             'loc': parsed['loc'],
             'kw': parsed['kw'],
-            'count': parsed.get('count', 30),
+            'count': parsed.get('count', 100),
             'rating': parsed.get('rating')
         }
         await msg.delete()
@@ -609,7 +594,7 @@ async def execute_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         leads = await loop.run_in_executor(None, scrape_free, data['loc'], data['kw'], data['count'], data.get('rating'))
         
         if not leads:
-            return await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text="😔 কোনো result নেই।")
+            return await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text="😔 কোনো result নেই। দয়া করে দেশের নামের বদলে নির্দিষ্ট শহরের নাম (যেমন: Toronto) দিয়ে সার্চ করো।")
 
         path = to_csv(leads)
         em = sum(1 for l in leads if str(l.get('Email','')) not in ('N/A','','None'))
