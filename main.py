@@ -15,35 +15,54 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 APIFY_TOKEN    = os.getenv("APIFY_API_TOKEN")
 GROQ_KEY       = os.getenv("GROQ_API_KEY", "")
+SCRAPER_KEY    = os.getenv("SCRAPER_API_KEY", "")
 
 # Runtime settings (dashboard থেকে update হয়)
-runtime = {"groq_key": GROQ_KEY}
+runtime = {
+    "groq_key":    GROQ_KEY,
+    "scraper_key": SCRAPER_KEY,
+}
 
 # ══════════════════════════════════════════
-#  EMAIL EXTRACTOR
+#  EMAIL EXTRACTOR  (ScraperAPI দিয়ে)
 # ══════════════════════════════════════════
 EMAIL_RE   = r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
 EMAIL_SKIP = ['example','domain','sentry','wixpress','noreply','@2x','.png','.jpg','no-reply','amazonaws']
 
+def _fetch_html(url, scraper_key=None):
+    """ScraperAPI থাকলে সেটা দিয়ে, না থাকলে সরাসরি requests দিয়ে fetch করে।"""
+    hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    if scraper_key:
+        api_url = "http://api.scraperapi.com"
+        params  = {"api_key": scraper_key, "url": url, "render": "false"}
+        r = requests.get(api_url, params=params, timeout=30)
+    else:
+        r = requests.get(url, headers=hdrs, timeout=8, verify=False)
+    r.raise_for_status()
+    return r.text
+
 def extract_email(url):
     if not url or url == 'N/A': return 'N/A'
     if not url.startswith('http'): url = 'http://' + url
-    hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    
+    scraper_key = runtime.get("scraper_key", "")
+
     def valid(emails):
-        return [e.lower() for e in emails if not any(s in e.lower() for s in EMAIL_SKIP) and '.' in e.split('@')[-1]]
-    
+        return [e.lower() for e in emails
+                if not any(s in e.lower() for s in EMAIL_SKIP) and '.' in e.split('@')[-1]]
+
     for path in ['', '/contact', '/contact-us', '/about']:
+        target = urllib.parse.urljoin(url, path)
         try:
-            r = requests.get(urllib.parse.urljoin(url, path), headers=hdrs, timeout=8, verify=False)
-            soup = BeautifulSoup(r.text, 'html.parser')
+            html = _fetch_html(target, scraper_key if scraper_key else None)
+            soup = BeautifulSoup(html, 'html.parser')
             for a in soup.find_all('a', href=True):
                 if a['href'].startswith('mailto:'):
-                    e = a['href'].replace('mailto:','').split('?')[0].strip()
+                    e = a['href'].replace('mailto:', '').split('?')[0].strip()
                     if valid([e]): return e
-            found = valid(re.findall(EMAIL_RE, r.text))
+            found = valid(re.findall(EMAIL_RE, html))
             if found: return found[0]
-        except: continue
+        except:
+            continue
     return 'N/A'
 
 # ══════════════════════════════════════════
@@ -80,7 +99,7 @@ def scrape_leads(location, keyword, max_leads=50):
 #  GROQ AI PARSER
 # ══════════════════════════════════════════
 def parse_with_ai(text):
-    key = runtime.get("groq_key","")
+    key = runtime.get("groq_key", "")
     if not key: raise Exception("Groq API Key নেই। Settings এ গিয়ে যোগ করো।")
     client = Groq(api_key=key)
     prompt = f'''Extract from user input:
@@ -91,7 +110,7 @@ def parse_with_ai(text):
 Input: "{text}"
 Return ONLY valid JSON: {{"loc":"...","kw":"...","count":50}}'''
     resp = client.chat.completions.create(
-        messages=[{"role":"user","content":prompt}],
+        messages=[{"role": "user", "content": prompt}],
         model="llama3-8b-8192", temperature=0
     )
     m = re.search(r'\{.*\}', resp.choices[0].message.content, re.DOTALL)
@@ -121,6 +140,8 @@ HTML = r"""<!DOCTYPE html>
   .btn-primary:hover{transform:translateY(-1px);box-shadow:0 8px 20px rgba(99,102,241,0.4)}
   .btn-green{background:linear-gradient(135deg,#10b981,#059669);transition:all .2s}
   .btn-green:hover{transform:translateY(-1px);box-shadow:0 8px 20px rgba(16,185,129,0.4)}
+  .btn-orange{background:linear-gradient(135deg,#f59e0b,#d97706);transition:all .2s}
+  .btn-orange:hover{transform:translateY(-1px);box-shadow:0 8px 20px rgba(245,158,11,0.4)}
   .tab-active{background:linear-gradient(135deg,#6366f1,#8b5cf6)!important;color:white!important}
   .stat-card{background:linear-gradient(135deg,rgba(99,102,241,0.1),rgba(139,92,246,0.05));border:1px solid rgba(99,102,241,0.2)}
   .progress-bar{height:6px;background:#1e293b;border-radius:99px;overflow:hidden}
@@ -130,6 +151,9 @@ HTML = r"""<!DOCTYPE html>
   .chat-msg-bot{background:rgba(99,102,241,0.1);border:1px solid rgba(99,102,241,0.2);border-radius:16px 16px 16px 4px}
   .chat-msg-user{background:linear-gradient(135deg,#6366f1,#8b5cf6);border-radius:16px 16px 4px 16px}
   .tag{display:inline-block;padding:2px 10px;border-radius:99px;font-size:11px;font-weight:600}
+  .api-badge-ok{background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.4);color:#34d399}
+  .api-badge-no{background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#f87171}
+  .scraper-badge{background:rgba(245,158,11,0.15);border:1px solid rgba(245,158,11,0.3);color:#fbbf24}
 </style>
 </head>
 <body class="min-h-screen">
@@ -144,11 +168,12 @@ HTML = r"""<!DOCTYPE html>
       <h1 class="text-xl font-bold text-white">LeadGen <span style="color:#a78bfa">Pro</span></h1>
       <div class="flex items-center gap-2">
         <span class="w-2 h-2 rounded-full bg-green-400 pulse"></span>
-        <span class="text-xs text-gray-400">Powered by Apify + Groq AI</span>
+        <span class="text-xs text-gray-400">Powered by Apify + Groq AI + ScraperAPI</span>
       </div>
     </div>
   </div>
   <div class="flex items-center gap-3">
+    <span id="scraper-status" class="tag scraper-badge hidden"><i class="fa-solid fa-spider mr-1"></i>ScraperAPI Active</span>
     <span id="total-badge" class="tag" style="background:rgba(99,102,241,0.2);color:#a78bfa">0 Leads Today</span>
     <button onclick="showTab('settings')" class="w-10 h-10 glass rounded-xl flex items-center justify-center hover:border-indigo-500 transition">
       <i class="fa-solid fa-gear text-gray-400"></i>
@@ -159,7 +184,7 @@ HTML = r"""<!DOCTYPE html>
 <div class="max-w-6xl mx-auto px-4 py-8">
 
   <!-- STATS ROW -->
-  <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8" id="stats-row">
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
     <div class="stat-card rounded-2xl p-4">
       <div class="text-2xl font-bold text-white" id="s-total">0</div>
       <div class="text-xs text-gray-400 mt-1">Total Leads</div>
@@ -297,20 +322,64 @@ HTML = r"""<!DOCTYPE html>
 
   <!-- SETTINGS TAB -->
   <div id="pane-settings" class="hidden">
-    <div class="glass rounded-2xl p-6 space-y-5">
-      <h2 class="text-lg font-bold text-white"><i class="fa-solid fa-key mr-2 text-yellow-400"></i>Settings</h2>
+    <div class="glass rounded-2xl p-6 space-y-6">
+      <h2 class="text-lg font-bold text-white"><i class="fa-solid fa-key mr-2 text-yellow-400"></i>API Settings</h2>
+
+      <!-- Apify Status -->
       <div class="p-4 rounded-xl" style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.3)">
-        <div class="text-sm text-green-400"><i class="fa-solid fa-check-circle mr-2"></i>Apify scraping active. Highly reliable!</div>
+        <div class="text-sm text-green-400 font-semibold mb-1">
+          <i class="fa-solid fa-check-circle mr-2"></i>Apify — Google Maps Scraping
+        </div>
+        <div class="text-xs text-gray-400">Apify token .env থেকে load হয়। Google Maps data scraping এর জন্য।</div>
       </div>
+
+      <!-- ScraperAPI Key -->
       <div>
-        <label class="text-xs text-gray-400 mb-2 block">Groq API Key (AI Agent এর জন্য)</label>
-        <input id="groq-inp" type="password" class="w-full rounded-xl px-4 py-3 text-sm" placeholder="gsk_...">
-        <p class="text-xs text-gray-500 mt-2">Free key: <a href="https://console.groq.com/keys" target="_blank" class="text-indigo-400 underline">console.groq.com</a></p>
+        <div class="flex items-center justify-between mb-2">
+          <label class="text-sm font-semibold text-white">
+            <i class="fa-solid fa-spider mr-2 text-yellow-400"></i>ScraperAPI Key
+          </label>
+          <span id="scraper-key-badge" class="tag api-badge-no text-xs">Not Set</span>
+        </div>
+        <input id="scraper-inp" type="password" class="w-full rounded-xl px-4 py-3 text-sm" placeholder="Enter ScraperAPI key...">
+        <div class="flex items-center justify-between mt-2">
+          <p class="text-xs text-gray-500">
+            Free: 1000 req/month →
+            <a href="https://www.scraperapi.com/" target="_blank" class="text-yellow-400 underline">scraperapi.com</a>
+          </p>
+          <div class="flex items-center gap-2 text-xs text-gray-400">
+            <span id="scraper-usage-label" class="hidden">
+              <i class="fa-solid fa-chart-pie mr-1 text-yellow-400"></i>
+              Used: <span id="scraper-used">—</span> / 1000
+            </span>
+          </div>
+        </div>
+        <div class="mt-3 p-3 rounded-xl text-xs text-gray-400" style="background:rgba(245,158,11,0.07);border:1px solid rgba(245,158,11,0.2)">
+          <i class="fa-solid fa-circle-info mr-1 text-yellow-400"></i>
+          ScraperAPI ব্যবহার হয় website থেকে email scrape করার সময়। না থাকলে direct request যাবে (block হতে পারে)।
+        </div>
       </div>
+
+      <!-- Groq API Key -->
+      <div>
+        <div class="flex items-center justify-between mb-2">
+          <label class="text-sm font-semibold text-white">
+            <i class="fa-solid fa-robot mr-2 text-indigo-400"></i>Groq API Key
+          </label>
+          <span id="groq-key-badge" class="tag api-badge-no text-xs">Not Set</span>
+        </div>
+        <input id="groq-inp" type="password" class="w-full rounded-xl px-4 py-3 text-sm" placeholder="gsk_...">
+        <p class="text-xs text-gray-500 mt-2">
+          Free key →
+          <a href="https://console.groq.com/keys" target="_blank" class="text-indigo-400 underline">console.groq.com</a>
+          (AI Agent tab এর জন্য দরকার)
+        </p>
+      </div>
+
       <button onclick="saveSettings()" class="btn-primary w-full py-3 rounded-xl font-bold text-white text-sm">
-        <i class="fa-solid fa-save mr-2"></i>Save Settings
+        <i class="fa-solid fa-save mr-2"></i>Save All Settings
       </button>
-      <div id="save-msg" class="hidden text-center text-sm text-green-400 py-2">✅ Saved successfully!</div>
+      <div id="save-msg" class="hidden text-center text-sm text-green-400 py-2">✅ Settings সেভ হয়ে গেছে!</div>
     </div>
   </div>
 
@@ -320,16 +389,29 @@ HTML = r"""<!DOCTYPE html>
 let currentJob = null, aiState = {}, history = [], totalToday = 0;
 
 window.onload = () => {
-  const k = localStorage.getItem('groq_key');
-  if(k) document.getElementById('groq-inp').value = k;
+  const gk = localStorage.getItem('groq_key');
+  const sk = localStorage.getItem('scraper_key');
+  if(gk) { document.getElementById('groq-inp').value = gk; updateBadge('groq-key-badge', true); }
+  if(sk) { document.getElementById('scraper-inp').value = sk; updateBadge('scraper-key-badge', true); document.getElementById('scraper-status').classList.remove('hidden'); document.getElementById('scraper-usage-label').classList.remove('hidden'); }
   loadHistory();
+  // Sync saved keys to server on load
+  if(gk || sk) {
+    fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({groq: gk||'', scraper: sk||''})});
+  }
 };
+
+function updateBadge(id, ok) {
+  const el = document.getElementById(id);
+  if(ok) { el.textContent = '✓ Active'; el.className = 'tag api-badge-ok text-xs'; }
+  else    { el.textContent = 'Not Set';  el.className = 'tag api-badge-no text-xs'; }
+}
 
 function showTab(t) {
   ['manual','ai','history','settings'].forEach(x => {
     document.getElementById('pane-'+x).classList.add('hidden');
     const btn = document.getElementById('tab-'+x);
-    if(btn) btn.className = btn.className.replace('tab-active','').trim() + ' text-gray-400';
+    if(btn) btn.className = btn.className.replace('tab-active','').replace('text-gray-400','').trim() + ' text-gray-400';
   });
   document.getElementById('pane-'+t).classList.remove('hidden');
   const ab = document.getElementById('tab-'+t);
@@ -337,11 +419,27 @@ function showTab(t) {
 }
 
 function saveSettings() {
-  const k = document.getElementById('groq-inp').value.trim();
-  if(!k) return alert('API Key দাও!');
-  localStorage.setItem('groq_key', k);
-  fetch('/api/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({groq:k})})
-  .then(() => { document.getElementById('save-msg').classList.remove('hidden'); setTimeout(() => document.getElementById('save-msg').classList.add('hidden'), 3000); });
+  const gk = document.getElementById('groq-inp').value.trim();
+  const sk = document.getElementById('scraper-inp').value.trim();
+  if(!gk && !sk) return alert('কমপক্ষে একটা API Key দাও!');
+  if(gk) { localStorage.setItem('groq_key', gk); updateBadge('groq-key-badge', true); }
+  if(sk) {
+    localStorage.setItem('scraper_key', sk);
+    updateBadge('scraper-key-badge', true);
+    document.getElementById('scraper-status').classList.remove('hidden');
+    document.getElementById('scraper-usage-label').classList.remove('hidden');
+  }
+  fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({groq: gk, scraper: sk})})
+  .then(r => r.json())
+  .then(d => {
+    const msg = document.getElementById('save-msg');
+    msg.classList.remove('hidden');
+    if(d.scraper_credits !== undefined) {
+      document.getElementById('scraper-used').textContent = 1000 - d.scraper_credits;
+    }
+    setTimeout(() => msg.classList.add('hidden'), 3000);
+  });
 }
 
 function updateStats(leads) {
@@ -369,20 +467,21 @@ async function startJob(payload) {
   document.getElementById('dl-btn').classList.add('hidden');
   document.getElementById('preview-box').classList.add('hidden');
 
-  const r = await fetch('/api/scrape', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const r = await fetch('/api/scrape', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
   const d = await r.json();
   if(d.error) return setStatus(d.error,'error');
   currentJob = d.job_id;
 
   let pct = 10;
-  const iv = setInterval(() => { pct = Math.min(pct+5,85); document.getElementById('st-bar').style.width=pct+'%'; }, 8000);
-  
+  const iv = setInterval(() => { pct = Math.min(pct+5, 85); document.getElementById('st-bar').style.width=pct+'%'; }, 8000);
+
   const poll = async () => {
     const r2 = await fetch('/api/status/'+currentJob);
     const d2 = await r2.json();
     if(d2.status==='done') {
       clearInterval(iv);
-      setStatus(`✅ সম্পন্ন! ${d2.count} টি lead পাওয়া গেছে।`, 'done', 100);
+      const scraperNote = d2.scraper_used ? ' (ScraperAPI ✓)' : '';
+      setStatus(`✅ সম্পন্ন! ${d2.count} টি lead পাওয়া গেছে।${scraperNote}`, 'done', 100);
       document.getElementById('dl-btn').classList.remove('hidden');
       document.getElementById('st-details').textContent = `📧 Email: ${d2.emails} | 📞 Phone: ${d2.phones} | 🌐 Website: ${d2.websites}`;
       updateStats(d2.leads||[]);
@@ -410,7 +509,6 @@ function showPreview(leads) {
   const box = document.getElementById('preview-box');
   box.classList.remove('hidden');
   document.getElementById('preview-count').textContent = '('+leads.length+' rows)';
-  
   const keys = Object.keys(leads[0]);
   document.getElementById('tbl-head').innerHTML = keys.map(k=>`<th class="px-3 py-2 text-left font-medium">${k}</th>`).join('');
   document.getElementById('tbl-body').innerHTML = leads.slice(0,10).map(l=>
@@ -419,7 +517,7 @@ function showPreview(leads) {
 }
 
 function addHistory(loc, kw, count) {
-  const item = {loc,kw,count,time:new Date().toLocaleTimeString()};
+  const item = {loc, kw, count, time: new Date().toLocaleTimeString()};
   history.unshift(item);
   localStorage.setItem('lead_history', JSON.stringify(history.slice(0,20)));
   renderHistory();
@@ -471,7 +569,8 @@ async function sendAI() {
   addMsg(text, true); inp.value='';
   addMsg('<i class="fa-solid fa-ellipsis fa-fade"></i>', false, true);
 
-  const r = await fetch('/api/chat', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,state:aiState,groq_key:key})});
+  const r = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({text, state:aiState, groq_key:key})});
   const d = await r.json();
   document.getElementById('chat-box').lastChild.remove();
 
@@ -479,7 +578,7 @@ async function sendAI() {
   if(d.ready) {
     aiState = d.state;
     addMsg(`Got it! Starting search...<br>📍 <b>${d.state.loc}</b> · 🔍 <b>${d.state.kw}</b> · 🔢 <b>${d.state.count}</b> leads<br><br>
-      <button onclick="startJob({location:'${d.state.loc}',keyword:'${d.state.kw}',max_leads:${d.state.count}})" 
+      <button onclick="startJob({location:'${d.state.loc}',keyword:'${d.state.kw}',max_leads:${d.state.count}})"
         style="background:linear-gradient(135deg,#10b981,#059669);padding:8px 20px;border-radius:10px;font-weight:700;color:white;margin-top:8px;cursor:pointer">
         🚀 Start Now</button>`, false, true);
     showTab('manual');
@@ -494,38 +593,56 @@ def index(): return render_template_string(HTML)
 
 @flask_app.route('/api/settings', methods=['POST'])
 def api_settings():
-    if request.json.get('groq'): runtime['groq_key'] = request.json['groq']
-    return jsonify({"ok": True})
+    data = request.json or {}
+    if data.get('groq'):    runtime['groq_key']    = data['groq']
+    if data.get('scraper'): runtime['scraper_key'] = data['scraper']
+
+    # ScraperAPI remaining credits check
+    scraper_credits = None
+    sk = runtime.get('scraper_key', '')
+    if sk:
+        try:
+            r = requests.get(f"http://api.scraperapi.com/account?api_key={sk}", timeout=5)
+            info = r.json()
+            scraper_credits = info.get('requestLimit', 1000) - info.get('requestCount', 0)
+        except:
+            pass
+
+    return jsonify({"ok": True, "scraper_credits": scraper_credits})
 
 @flask_app.route('/api/chat', methods=['POST'])
 def api_chat():
-    text     = request.json.get('text','')
-    groq_key = request.json.get('groq_key','')
-    state    = request.json.get('state',{})
+    text     = request.json.get('text', '')
+    groq_key = request.json.get('groq_key', '')
+    state    = request.json.get('state', {})
     runtime['groq_key'] = groq_key
     try:
         parsed = parse_with_ai(text)
-        if parsed.get('loc'): state['loc']   = parsed['loc']
-        if parsed.get('kw'):  state['kw']    = parsed['kw']
+        if parsed.get('loc'):   state['loc']   = parsed['loc']
+        if parsed.get('kw'):    state['kw']    = parsed['kw']
         if parsed.get('count'): state['count'] = parsed['count']
         if not state.get('loc') or not state.get('kw'):
-            return jsonify({"ready":False,"reply":"Location আর keyword বলো।"})
-        return jsonify({"ready":True,"state":state})
+            return jsonify({"ready": False, "reply": "Location আর keyword বলো।"})
+        return jsonify({"ready": True, "state": state})
     except Exception as e:
-        return jsonify({"error":str(e)})
+        return jsonify({"error": str(e)})
 
 def run_job(job_id, data):
     try:
-        jobs[job_id] = {'status':'running'}
-        leads = scrape_leads(data['location'], data['keyword'], data.get('max_leads',50))
+        jobs[job_id] = {'status': 'running'}
+        leads = scrape_leads(data['location'], data['keyword'], data.get('max_leads', 50))
+        scraper_used = bool(runtime.get('scraper_key', ''))
         jobs[job_id] = {
-            'status':'done','leads':leads,'count':len(leads),
-            'emails':  sum(1 for l in leads if l.get('Email','N/A') not in ('N/A','')),
-            'phones':  sum(1 for l in leads if l.get('Phone','N/A') not in ('N/A','')),
-            'websites':sum(1 for l in leads if l.get('Website','N/A') not in ('N/A','')),
+            'status':       'done',
+            'leads':        leads,
+            'count':        len(leads),
+            'emails':       sum(1 for l in leads if l.get('Email','N/A') not in ('N/A','')),
+            'phones':       sum(1 for l in leads if l.get('Phone','N/A') not in ('N/A','')),
+            'websites':     sum(1 for l in leads if l.get('Website','N/A') not in ('N/A','')),
+            'scraper_used': scraper_used,
         }
     except Exception as e:
-        jobs[job_id] = {'status':'error','error':str(e)}
+        jobs[job_id] = {'status': 'error', 'error': str(e)}
 
 @flask_app.route('/api/scrape', methods=['POST'])
 def api_scrape():
@@ -535,13 +652,13 @@ def api_scrape():
 
 @flask_app.route('/api/status/<jid>')
 def api_status(jid):
-    j = jobs.get(jid, {'status':'not_found'})
-    return jsonify({**j, 'leads': j.get('leads',[])[:10] if j.get('status')=='done' else []})
+    j = jobs.get(jid, {'status': 'not_found'})
+    return jsonify({**j, 'leads': j.get('leads', [])[:10] if j.get('status') == 'done' else []})
 
 @flask_app.route('/api/download/<jid>')
 def api_download(jid):
     j = jobs.get(jid)
-    if not j or j['status']!='done': return "Not ready",400
+    if not j or j['status'] != 'done': return "Not ready", 400
     leads = j['leads']
     out = io.StringIO()
     writer = csv.DictWriter(out, fieldnames=leads[0].keys())
@@ -556,7 +673,7 @@ M_LOC, M_KW, M_COUNT = range(3)
 bot_store = {}
 
 def to_csv_file(leads):
-    tmp = tempfile.NamedTemporaryFile(mode='w',suffix='.csv',delete=False,encoding='utf-8-sig',newline='')
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8-sig', newline='')
     writer = csv.DictWriter(tmp, fieldnames=leads[0].keys())
     writer.writeheader(); writer.writerows(leads); tmp.close()
     return tmp.name
@@ -564,7 +681,7 @@ def to_csv_file(leads):
 async def tg_start(update: Update, ctx):
     kb = [[InlineKeyboardButton("🔍 Search Leads", callback_data="go")]]
     await update.message.reply_text(
-        "👋 *LeadGen Pro Bot*\n\nGoogle Maps থেকে leads বের করবো।\nShows: Name, Phone, Email, Address, Website\n\nShুরু করতে নিচের বাটনে ক্লিক করো!",
+        "👋 *LeadGen Pro Bot*\n\nGoogle Maps থেকে leads বের করবো।\nShows: Name, Phone, Email, Address, Website\n\nশুরু করতে নিচের বাটনে ক্লিক করো!",
         parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
 
 async def tg_go(update: Update, ctx):
@@ -584,11 +701,11 @@ async def tg_kw(update: Update, ctx):
     return M_COUNT
 
 async def tg_count(update: Update, ctx):
-    uid  = update.message.from_user.id
+    uid = update.message.from_user.id
     bot_store[uid]['max_leads'] = update.message.text.strip()
-    d    = bot_store[uid]
-    kb   = [[InlineKeyboardButton("✅ শুরু করো", callback_data="scrape"),
-             InlineKeyboardButton("❌ বাতিল",    callback_data="cancel")]]
+    d   = bot_store[uid]
+    kb  = [[InlineKeyboardButton("✅ শুরু করো", callback_data="scrape"),
+            InlineKeyboardButton("❌ বাতিল",    callback_data="cancel")]]
     await update.message.reply_text(
         f"📋 *Summary*\n📍 {d['location']} · 🔍 {d['keyword']} · 🔢 {d['max_leads']} leads\n\nশুরু করবো?",
         parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
@@ -604,7 +721,7 @@ async def tg_scrape(update: Update, ctx):
     msg = await q.edit_message_text("⏳ *Scraping চলছে...*\n_৩–৫ মিনিট লাগতে পারে_", parse_mode='Markdown')
     try:
         loop  = asyncio.get_event_loop()
-        leads = await loop.run_in_executor(None, scrape_leads, d['location'], d['keyword'], d.get('max_leads',50))
+        leads = await loop.run_in_executor(None, scrape_leads, d['location'], d['keyword'], d.get('max_leads', 50))
         if not leads:
             await ctx.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg.message_id, text="😔 কোনো result নেই।")
             return
