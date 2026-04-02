@@ -1,14 +1,4 @@
-# ═══════════════════════════════════════════════════════════════════════════
-# LEADGEN PRO - ENHANCED VERSION
-# Added: Multi-keyword input, Scheduling (BD Time), Advanced keyword generation,
-# Negative review targeting, Improved website extraction, Smart email personalization
-# ═══════════════════════════════════════════════════════════════════════════
-
-import os, csv, asyncio, tempfile, threading, io, uuid, re, time, json, urllib.parse, random, logging, sqlite3
-from datetime import datetime, timedelta
-from collections import defaultdict
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional, Tuple, Any
+import os, csv, asyncio, tempfile, threading, io, uuid, re, time, json, urllib.parse, random
 import requests
 import concurrent.futures
 import urllib3
@@ -21,1026 +11,854 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 )
-import pytz
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 
+# Suppress SSL warnings for cleaner logs and slightly faster requests
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
-# ═══════════════════════════════════════════════════════════════════════════
-# LOGGING SETUP
-# ═══════════════════════════════════════════════════════════════════════════
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s — %(message)s',
-    datefmt='%H:%M:%S'
-)
-logger = logging.getLogger("LeadGenPro")
-
+# ==========================================
+# ⚙️ CONFIGURATION
+# ==========================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DATABASE FOR SCHEDULING & JOBS
-# ═══════════════════════════════════════════════════════════════════════════
-class JobDatabase:
-    def __init__(self, db_path="jobs.db"):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.cursor = self.conn.cursor()
-        self._init_tables()
-    
-    def _init_tables(self):
-        # Keyword sets (multiple per job)
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS keyword_sets (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_group_id TEXT NOT NULL,
-                keyword TEXT NOT NULL,
-                location TEXT NOT NULL,
-                target_leads INTEGER DEFAULT 10,
-                min_rating REAL,
-                max_rating REAL,
-                status TEXT DEFAULT 'pending',
-                leads_found INTEGER DEFAULT 0,
-                completed_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Scheduled jobs
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS scheduled_jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_group_id TEXT NOT NULL,
-                schedule_time TIMESTAMP NOT NULL,
-                status TEXT DEFAULT 'pending',
-                executed_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Keywords generated (store all)
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS generated_keywords (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_group_id TEXT NOT NULL,
-                seed_keyword TEXT NOT NULL,
-                generated_keyword TEXT NOT NULL,
-                source TEXT NOT NULL,
-                used BOOLEAN DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        self.conn.commit()
-    
-    def add_keyword_set(self, job_group_id: str, keyword_data: dict) -> int:
-        self.cursor.execute('''
-            INSERT INTO keyword_sets (job_group_id, keyword, location, target_leads, min_rating, max_rating)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (job_group_id, keyword_data['keyword'], keyword_data['location'], 
-              keyword_data.get('target_leads', 10), keyword_data.get('min_rating'),
-              keyword_data.get('max_rating')))
-        self.conn.commit()
-        return self.cursor.lastrowid
-    
-    def get_pending_keyword_sets(self, job_group_id: str) -> List[dict]:
-        self.cursor.execute('''
-            SELECT * FROM keyword_sets 
-            WHERE job_group_id = ? AND status = 'pending'
-            ORDER BY id ASC
-        ''', (job_group_id,))
-        rows = self.cursor.fetchall()
-        columns = [desc[0] for desc in self.cursor.description]
-        return [dict(zip(columns, row)) for row in rows]
-    
-    def update_keyword_set_status(self, set_id: int, status: str, leads_found: int = None):
-        if leads_found is not None:
-            self.cursor.execute('''
-                UPDATE keyword_sets SET status = ?, leads_found = ?, completed_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            ''', (status, leads_found, set_id))
-        else:
-            self.cursor.execute('''
-                UPDATE keyword_sets SET status = ?, completed_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            ''', (status, set_id))
-        self.conn.commit()
-    
-    def add_scheduled_job(self, job_group_id: str, schedule_time: datetime) -> int:
-        self.cursor.execute('''
-            INSERT INTO scheduled_jobs (job_group_id, schedule_time)
-            VALUES (?, ?)
-        ''', (job_group_id, schedule_time))
-        self.conn.commit()
-        return self.cursor.lastrowid
-    
-    def get_pending_scheduled_jobs(self) -> List[dict]:
-        self.cursor.execute('''
-            SELECT * FROM scheduled_jobs 
-            WHERE status = 'pending' AND schedule_time <= CURRENT_TIMESTAMP
-            ORDER BY schedule_time ASC
-        ''')
-        rows = self.cursor.fetchall()
-        columns = [desc[0] for desc in self.cursor.description]
-        return [dict(zip(columns, row)) for row in rows]
-    
-    def update_scheduled_job_status(self, job_id: int, status: str):
-        self.cursor.execute('''
-            UPDATE scheduled_jobs SET status = ?, executed_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        ''', (status, job_id))
-        self.conn.commit()
-    
-    def add_generated_keyword(self, job_group_id: str, seed_keyword: str, generated: str, source: str):
-        self.cursor.execute('''
-            INSERT INTO generated_keywords (job_group_id, seed_keyword, generated_keyword, source)
-            VALUES (?, ?, ?, ?)
-        ''', (job_group_id, seed_keyword, generated, source))
-        self.conn.commit()
-    
-    def get_unused_keywords(self, job_group_id: str, limit: int = 200) -> List[str]:
-        self.cursor.execute('''
-            SELECT generated_keyword FROM generated_keywords 
-            WHERE job_group_id = ? AND used = 0
-            ORDER BY created_at ASC
-            LIMIT ?
-        ''', (job_group_id, limit))
-        return [row[0] for row in self.cursor.fetchall()]
-    
-    def mark_keyword_used(self, job_group_id: str, keyword: str):
-        self.cursor.execute('''
-            UPDATE generated_keywords SET used = 1
-            WHERE job_group_id = ? AND generated_keyword = ?
-        ''', (job_group_id, keyword))
-        self.conn.commit()
-
-db = JobDatabase()
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ENHANCED KEYWORD ENGINE - GUARANTEED 100+ KEYWORDS
-# ═══════════════════════════════════════════════════════════════════════════
-class EnhancedKeywordEngine:
-    """Generates 100+ high-quality commercial keywords using multiple strategies"""
-    
-    # Extensive keyword modifiers
-    INTENT_PREFIXES = [
-        "best", "top", "affordable", "cheap", "local", "professional", "experienced",
-        "certified", "trusted", "rated", "licensed", "expert", "reliable", "fast",
-        "emergency", "24 hour", "same day", "family", "luxury", "premium", "budget",
-        "high quality", "award winning", "recommended", "leading", "specialist"
+def get_headers():
+    HEADERS_LIST = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/118.0.0.0 Safari/537.36",
     ]
-    
-    INTENT_SUFFIXES = [
-        "services", "company", "agency", "near me", "in my area", "specialist",
-        "experts", "professionals", "contractor", "provider", "consultant", "firm",
-        "studio", "clinic", "center", "shop", "office", "team", "solutions", "group"
-    ]
-    
-    PROBLEM_BASED = [
-        "complaints about", "bad reviews", "poor service", "negative feedback",
-        "problems with", "issues with", "not recommended", "avoid", "worst",
-        "low rated", "dissatisfied", "unhappy customers"
-    ]
-    
-    # Niche-specific expansions
-    NICHE_EXPANSIONS = {
-        "restaurant": ["takeout", "delivery", "dine in", "catering", "buffet", 
-                       "brunch", "dinner", "lunch", "breakfast", "fine dining",
-                       "casual dining", "family friendly", "romantic", "cheap eats"],
-        "dentist": ["dental clinic", "teeth whitening", "orthodontist", "braces", 
-                    "dental implants", "root canal", "emergency dentist", "pediatric dentist",
-                    "cosmetic dentistry", "oral surgery", "dental cleaning"],
-        "lawyer": ["attorney", "law firm", "legal services", "counsel", "litigation",
-                   "personal injury", "family law", "criminal defense", "business law",
-                   "estate planning", "immigration lawyer", "divorce attorney"],
-        "plumber": ["plumbing", "pipe repair", "drain cleaning", "water heater",
-                    "leak fix", "emergency plumber", "bathroom renovation", "toilet repair",
-                    "sewer line", "gas fitting", "hydro jetting"],
-        "realtor": ["real estate agent", "property dealer", "home buyer", "home seller",
-                    "property management", "real estate broker", "listing agent", "buyers agent",
-                    "commercial real estate", "luxury homes", "first time home buyer"],
-        "gym": ["fitness center", "workout", "personal trainer", "crossfit", "yoga studio",
-                "weight training", "cardio", "group classes", "24 hour gym", "martial arts",
-                "pilates", "spin class", "boot camp"],
-        "salon": ["hair salon", "beauty salon", "spa", "barber shop", "nail salon",
-                  "hair styling", "color treatment", "manicure", "pedicure", "facial",
-                  "massage", "waxing", "makeup artist"],
-        "doctor": ["physician", "medical clinic", "urgent care", "specialist", "general practitioner",
-                   "family doctor", "internal medicine", "pediatrics", "gynecology", "cardiology",
-                   "dermatology", "neurology", "orthopedics"]
+    return {
+        "User-Agent": random.choice(HEADERS_LIST),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Referer": "https://www.google.com/",
     }
-    
-    def __init__(self):
-        self.session = requests.Session()
-    
-    def generate_google_autosuggest(self, keyword: str, location: str) -> List[str]:
-        """Extract autosuggest suggestions from Google"""
-        results = set()
-        base_terms = [
-            keyword, 
-            f"{keyword} {location}", 
-            f"best {keyword}", 
-            f"{keyword} services",
-            f"{keyword} near me"
-        ]
-        
-        for term in base_terms:
-            try:
-                # Primary autosuggest endpoint
-                url = f"https://suggestqueries.google.com/complete/search?client=firefox&q={urllib.parse.quote_plus(term)}"
-                resp = self.session.get(url, headers=get_headers(), timeout=5)
-                data = resp.json()
-                if isinstance(data, list) and len(data) > 1:
-                    for suggestion in data[1]:
-                        results.add(suggestion.strip())
-                
-                # Alternative endpoint
-                url2 = f"https://www.google.com/complete/search?client=chrome&q={urllib.parse.quote_plus(term)}"
-                resp2 = self.session.get(url2, headers=get_headers(), timeout=5)
-                data2 = resp2.json()
-                if isinstance(data2, list) and len(data2) > 1:
-                    for suggestion in data2[1]:
-                        results.add(suggestion.strip())
-                        
-            except Exception as e:
-                logger.debug(f"[KEYWORDS] Autosuggest failed: {e}")
-            
-            time.sleep(0.2)
-        
-        logger.info(f"[KEYWORDS] Autosuggest generated {len(results)} keywords")
-        return list(results)
-    
-    def generate_related_searches(self, keyword: str) -> List[str]:
-        """Extract related searches from Google"""
-        results = set()
-        try:
-            url = f"https://www.google.com/search?q={urllib.parse.quote_plus(keyword)}"
-            resp = self.session.get(url, headers=get_headers(), timeout=8)
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            
-            # Find related searches section
-            related_selectors = [
-                '.s75CSd', '.k8XOCe', '.related-queries', '.card-section',
-                'div[jsname="yEVEwb"]', '.Wt5Tfe'
-            ]
-            
-            for selector in related_selectors:
-                elements = soup.select(selector)
-                for el in elements:
-                    text = el.get_text(strip=True)
-                    if text and len(text) > 3 and len(text) < 100:
-                        results.add(text)
-            
-            # Extract from "People also ask"
-            paa_elements = soup.select('.rPeykc, .CQKzVb, .related-question-pair')
-            for el in paa_elements:
-                text = el.get_text(strip=True)
-                if text and '?' in text:
-                    # Convert question to keyword
-                    kw = text.replace('?', '').lower()
-                    results.add(kw)
-                    
-        except Exception as e:
-            logger.debug(f"[KEYWORDS] Related searches failed: {e}")
-        
-        logger.info(f"[KEYWORDS] Related searches generated {len(results)} keywords")
-        return list(results)
-    
-    def expand_with_modifiers(self, keyword: str) -> List[str]:
-        """Apply prefix and suffix modifiers"""
-        results = set()
-        
-        # Prefix combinations
-        for prefix in self.INTENT_PREFIXES:
-            results.add(f"{prefix} {keyword}")
-        
-        # Suffix combinations
-        for suffix in self.INTENT_SUFFIXES:
-            results.add(f"{keyword} {suffix}")
-        
-        # Problem-based targeting (for negative reviews)
-        for problem in self.PROBLEM_BASED:
-            results.add(f"{keyword} {problem}")
-            results.add(f"{problem} {keyword}")
-        
-        # Combination variations
-        for prefix in self.INTENT_PREFIXES[:10]:
-            for suffix in self.INTENT_SUFFIXES[:5]:
-                results.add(f"{prefix} {keyword} {suffix}")
-        
-        logger.info(f"[KEYWORDS] Modifier expansion generated {len(results)} keywords")
-        return list(results)
-    
-    def generate_niche_specific(self, keyword: str) -> List[str]:
-        """Generate niche-specific variations"""
-        results = set()
-        keyword_lower = keyword.lower()
-        
-        # Find matching niche
-        for niche, expansions in self.NICHE_EXPANSIONS.items():
-            if niche in keyword_lower or keyword_lower in niche:
-                for expansion in expansions:
-                    results.add(f"{expansion} {keyword}")
-                    results.add(f"{keyword} {expansion}")
-                    # Add with location intent
-                    results.add(f"{expansion} near me")
-        
-        # Generic service expansions
-        service_types = ["service", "repair", "installation", "maintenance", "consultation"]
-        for service in service_types:
-            results.add(f"{keyword} {service}")
-            results.add(f"professional {keyword} {service}")
-        
-        logger.info(f"[KEYWORDS] Niche specific generated {len(results)} keywords")
-        return list(results)
-    
-    def generate_synonym_variations(self, keyword: str) -> List[str]:
-        """Generate synonyms using AI"""
-        if not GROQ_API_KEY:
-            return []
-        
-        try:
-            client = Groq(api_key=GROQ_API_KEY)
-            prompt = f"""Generate 30 different synonyms and variations for the keyword: "{keyword}"
-            Consider:
-            - Different ways people search for this service
-            - Local variations
-            - Industry-specific terminology
-            - Common misspellings (optional)
-            
-            Return ONLY a comma-separated list. No numbers, no explanations."""
-            
-            resp = client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model="llama3-8b-8192",
-                temperature=0.7,
-                max_tokens=500
-            )
-            
-            text = resp.choices[0].message.content
-            synonyms = [k.strip().lower() for k in text.split(',') if k.strip()]
-            logger.info(f"[KEYWORDS] AI synonyms generated {len(synonyms)} keywords")
-            return synonyms
-            
-        except Exception as e:
-            logger.warning(f"[KEYWORDS] Synonym generation failed: {e}")
-            return []
-    
-    def generate_complete_keyword_pool(self, seed_keyword: str, location: str, job_group_id: str) -> List[str]:
-        """Generate 100+ keywords using all strategies"""
-        all_keywords = set()
-        
-        # Strategy 1: Google Autosuggest
-        logger.info(f"[KEYWORDS] Strategy 1: Google Autosuggest for '{seed_keyword}'")
-        autosuggest = self.generate_google_autosuggest(seed_keyword, location)
-        all_keywords.update(autosuggest)
-        
-        # Strategy 2: Related Searches
-        logger.info(f"[KEYWORDS] Strategy 2: Related Searches for '{seed_keyword}'")
-        related = self.generate_related_searches(seed_keyword)
-        all_keywords.update(related)
-        
-        # Strategy 3: Modifier Expansion
-        logger.info(f"[KEYWORDS] Strategy 3: Modifier Expansion for '{seed_keyword}'")
-        modifiers = self.expand_with_modifiers(seed_keyword)
-        all_keywords.update(modifiers)
-        
-        # Strategy 4: Niche Specific
-        logger.info(f"[KEYWORDS] Strategy 4: Niche Specific for '{seed_keyword}'")
-        niche = self.generate_niche_specific(seed_keyword)
-        all_keywords.update(niche)
-        
-        # Strategy 5: AI Synonyms
-        logger.info(f"[KEYWORDS] Strategy 5: AI Synonyms for '{seed_keyword}'")
-        synonyms = self.generate_synonym_variations(seed_keyword)
-        all_keywords.update(synonyms)
-        
-        # Clean and filter
-        final_keywords = []
-        for kw in all_keywords:
-            kw_clean = re.sub(r'\s+', ' ', kw).strip()
-            if len(kw_clean) > 3 and len(kw_clean) < 80:
-                if not any(x in kw_clean for x in ['http', 'www.', '.com', 'javascript']):
-                    final_keywords.append(kw_clean)
-        
-        # Remove duplicates (case insensitive)
-        seen = set()
-        unique_keywords = []
-        for kw in final_keywords:
-            kw_lower = kw.lower()
-            if kw_lower not in seen:
-                seen.add(kw_lower)
-                unique_keywords.append(kw)
-        
-        # Store in database
-        for kw in unique_keywords:
-            db.add_generated_keyword(job_group_id, seed_keyword, kw, "keyword_engine")
-        
-        logger.info(f"[KEYWORDS] ✅ TOTAL generated: {len(unique_keywords)} unique keywords for '{seed_keyword}'")
-        
-        # Ensure minimum 100 keywords
-        if len(unique_keywords) < 100:
-            logger.warning(f"[KEYWORDS] Only {len(unique_keywords)} keywords, generating more...")
-            # Generate additional variations
-            for i in range(100 - len(unique_keywords)):
-                variation = f"{random.choice(self.INTENT_PREFIXES)} {seed_keyword} {random.choice(self.INTENT_SUFFIXES)}"
-                if variation not in seen:
-                    unique_keywords.append(variation)
-                    db.add_generated_keyword(job_group_id, seed_keyword, variation, "fallback")
-        
-        return unique_keywords[:300]  # Limit to 300 maximum
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ENHANCED WEBSITE EXTRACTOR - 90%+ SUCCESS RATE
-# ═══════════════════════════════════════════════════════════════════════════
-class EnhancedWebsiteExtractor:
-    """Multi-strategy website extraction with 90%+ success rate"""
-    
+# ══════════════════════════════════════════════
+#   [NEW] GOOGLE SHEETS ASYNC DATABASE WRAPPER
+# ══════════════════════════════════════════════
+class GoogleSheetsDB:
+    """Handles all database operations asynchronously so it doesn't slow down the scraper."""
+    def __init__(self, webhook_url):
+        self.url = webhook_url
+
+    def _post_async(self, payload):
+        try:
+            requests.post(self.url, json=payload, timeout=15)
+        except Exception as e:
+            pass # Fail silently in background to prevent crashing
+
+    def send_action(self, action, data):
+        if not self.url: return
+        payload = {"action": action, "data": data}
+        # Fire and forget thread
+        threading.Thread(target=self._post_async, args=(payload,), daemon=True).start()
+
+    def log(self, action, details):
+        self.send_action("log", {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "action": action,
+            "details": details
+        })
+
+# ══════════════════════════════════════════════
+#   1. SUPER FAST PURE PYTHON SCRAPER
+# ══════════════════════════════════════════════
+class GoogleMapsScraper:
+    def fetch_batch(self, keyword, location):
+        query = urllib.parse.quote_plus(f"{keyword} in {location}")
+        all_leads = []
+        
+        def get_offset(start):
+            url = f"https://www.google.com/search?q={query}&tbm=lcl&start={start}&num=20&hl=en"
+            try:
+                res = requests.get(url, headers=get_headers(), timeout=10)
+                soup = BeautifulSoup(res.text, 'html.parser')
+                blocks = soup.select('div.VkpGBb, div.rllt__details, div.uMdZh, div.cXedhc')
+                batch = []
+                
+                for block in blocks:
+                    text_content = block.get_text(separator=' ', strip=True)
+                    
+                    name_el = block.select_one('div[role="heading"], .dbg0pd, span.OSrXXb')
+                    name = name_el.get_text(strip=True) if name_el else "N/A"
+                    if name == "N/A" or len(name) < 3: continue
+                    
+                    rating_match = re.search(r'(\d[\.,]\d)\s*[\(\d]', text_content)
+                    rating = rating_match.group(1).replace(',', '.') if rating_match else "N/A"
+                    
+                    ph = re.search(r'(\+?\d{1,3}[\s\-\(\)]?\d{3,4}[\s\-\(\)]?\d{3,4}[\s\-\(\)]?\d{3,4})', text_content)
+                    phone = ph.group(0).strip() if ph else "N/A"
+                    
+                    website = "N/A"
+                    for a in block.select('a[href]'):
+                        href = a['href']
+                        if '/url?q=' in href:
+                            clean = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
+                            if 'google' not in clean.lower() and clean.startswith('http'):
+                                website = clean; break
+                        elif href.startswith('http') and 'google' not in href.lower():
+                            website = href; break
+                            
+                    batch.append({
+                        "Name": name,
+                        "Phone": phone,
+                        "Website": website,
+                        "Rating": rating,
+                        "Address": location,
+                        "Category": keyword,
+                        "Maps_Link": f"https://www.google.com/maps/search/{urllib.parse.quote_plus(name + ' ' + location)}"
+                    })
+                return batch
+            except Exception:
+                return []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            results = executor.map(get_offset, [0, 20, 40, 60, 80])
+            for res in results:
+                all_leads.extend(res)
+                
+        return all_leads
+
+# ══════════════════════════════════════════════
+#   2. DEEP EMAIL EXTRACTOR
+# ══════════════════════════════════════════════
+class DeepEmailExtractor:
     def __init__(self):
-        self.session = requests.Session()
-        self.business_registry = {}
-    
-    def is_valid_website(self, url: str) -> Tuple[bool, str]:
-        """Validate and clean website URL"""
-        if not url or url == "N/A":
-            return False, ""
+        self.email_regex = r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+        self.bad_keywords = ['example', 'domain', 'sentry', '@2x', '.png', '.jpg', '.jpeg', '.gif', 'wixpress', 'bootstrap', 'rating']
+
+    def is_valid_email(self, email):
+        email = email.lower()
+        return not any(bad in email for bad in self.bad_keywords)
+
+    def get_email(self, url):
+        if not url or url == "N/A": return "N/A"
+        if not url.startswith('http'): url = 'http://' + url
         
-        url = url.strip().lower()
-        
-        # Remove tracking parameters
-        url = re.sub(r'\?.*$', '', url)
-        url = re.sub(r'#.*$', '', url)
-        
-        # Social media and aggregator blacklist
-        blacklist = [
-            'google.com', 'google.co', 'yelp.com', 'tripadvisor.com', 'facebook.com',
-            'instagram.com', 'twitter.com', 'linkedin.com', 'youtube.com', 'bbb.org',
-            'yellowpages.com', 'mapquest.com', 'foursquare.com', 'yahoo.com', 'bing.com',
-            'zoominfo.com', 'chamberofcommerce.com', 'houzz.com', 'angi.com', 'thumbtack.com',
-            'nextdoor.com', 'whitepages.com', 'manta.com', 'superpages.com'
-        ]
-        
-        for blocked in blacklist:
-            if blocked in url:
-                return False, ""
-        
-        # Ensure proper format
-        if not url.startswith('http'):
-            url = 'https://' + url
-        
-        return True, url
-    
-    def extract_from_maps_details(self, maps_url: str) -> Optional[str]:
-        """Extract website from Google Maps detail page"""
-        if not maps_url or maps_url == "N/A":
-            return None
+        visited_urls = set()
         
         try:
-            resp = requests.get(maps_url, headers=get_headers(), timeout=12, verify=False)
+            r = requests.get(url, headers=get_headers(), timeout=6, verify=False)
+            visited_urls.add(url)
             
-            # Method 1: JSON-LD extraction
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            for script in soup.find_all('script', type='application/ld+json'):
+            emails = list(set(re.findall(self.email_regex, r.text)))
+            valid_emails = [e for e in emails if self.is_valid_email(e)]
+            if valid_emails: return valid_emails[0]
+            
+            soup = BeautifulSoup(r.text, 'html.parser')
+            internal_links = []
+            for a in soup.select('a[href]'):
+                href = a.get('href', '').lower()
+                if any(kw in href for kw in ['contact', 'about', 'support', 'help']):
+                    full_link = urllib.parse.urljoin(url, a['href'])
+                    if full_link not in visited_urls and full_link.startswith('http'):
+                        internal_links.append(full_link)
+            
+            for link in list(set(internal_links))[:3]:
                 try:
-                    data = json.loads(script.string)
-                    if isinstance(data, dict):
-                        url = data.get('url') or data.get('sameAs', [])
-                        if isinstance(url, list):
-                            for u in url:
-                                valid, clean = self.is_valid_website(u)
-                                if valid:
-                                    logger.info(f"[WEBSITE] Found in JSON-LD: {clean}")
-                                    return clean
-                        elif url:
-                            valid, clean = self.is_valid_website(url)
-                            if valid:
-                                logger.info(f"[WEBSITE] Found in JSON-LD: {clean}")
-                                return clean
+                    r2 = requests.get(link, headers=get_headers(), timeout=6, verify=False)
+                    visited_urls.add(link)
+                    emails2 = list(set(re.findall(self.email_regex, r2.text)))
+                    valid_emails2 = [e for e in emails2 if self.is_valid_email(e)]
+                    if valid_emails2: return valid_emails2[0]
                 except:
-                    pass
-            
-            # Method 2: Regex extraction
-            patterns = [
-                r'(?:https?://)?(?:www\.)?([a-zA-Z0-9\-]+\.(?:com|net|org|io|co|us|uk|ca|au|de|fr|jp|in|br|mx|it|es|nl|se|no|dk|fi|pl|ru|za|ae|sg|my|nz|ie|ch|be|at|cz|gr|hu|pt|ro|tr|il|sa|th|vn|ph|pk|eg|ng|ke|gh|tz|ug|zw|lk|bd|np|lk|mm|kh|la|mn|ge|am|az|kz|uz|tm|kg|tj|af|iq|sy|jo|lb|ps|ye|om|qa|kw|bh|cy|mt|is|lu|mc|li|ad|sm|va|me|rs|ba|hr|si|sk|bg|ro|md|ua|by|lt|lv|ee|is|mt|lu|mc|li|ad|sm|va|me|rs|ba|hr|si|sk|bg|ro|md|ua|by|lt|lv|ee|is))[/a-zA-Z0-9\-_]*',
-                r'"url":"(https?://[^"]+)"',
-                r'href="(https?://[^"]+)"[^>]*>website',
-                r'>website</a>\s*<a href="([^"]+)"',
-            ]
-            
-            for pattern in patterns:
-                matches = re.findall(pattern, resp.text, re.IGNORECASE)
-                for match in matches:
-                    url_to_check = match if match.startswith('http') else f"https://{match}"
-                    valid, clean = self.is_valid_website(url_to_check)
-                    if valid:
-                        logger.info(f"[WEBSITE] Found via regex: {clean}")
-                        return clean
-                        
-        except Exception as e:
-            logger.debug(f"[WEBSITE] Maps details extraction failed: {e}")
-        
-        return None
-    
-    def search_official_website(self, business_name: str, location: str) -> Optional[str]:
-        """Search Google for official website"""
-        search_queries = [
-            f"{business_name} {location} official website",
-            f"{business_name} official site",
-            f"{business_name} contact",
-            f"{business_name} {location} com"
-        ]
-        
-        for query in search_queries[:2]:  # Limit to 2 queries to avoid rate limiting
-            try:
-                url = f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}&num=5"
-                resp = requests.get(url, headers=get_headers(), timeout=8, verify=False)
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                
-                # Extract organic results
-                for result in soup.select('a[href^="/url?q="]'):
-                    href = result.get('href', '')
-                    if '/url?q=' in href:
-                        clean_url = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
-                        valid, clean = self.is_valid_website(clean_url)
-                        if valid:
-                            logger.info(f"[WEBSITE] Found via Google search: {clean}")
-                            return clean
-                            
-            except Exception as e:
-                logger.debug(f"[WEBSITE] Search failed for {query}: {e}")
-            
-            time.sleep(1)
-        
-        return None
-    
-    def extract_from_domain_guess(self, business_name: str) -> Optional[str]:
-        """Guess website based on business name"""
-        # Clean business name
-        name_clean = re.sub(r'[^\w\s]', '', business_name)
-        name_clean = name_clean.lower().strip()
-        name_clean = re.sub(r'\s+', '', name_clean)
-        
-        # Common domain patterns
-        patterns = [
-            f"https://{name_clean}.com",
-            f"https://www.{name_clean}.com",
-            f"https://{name_clean}.net",
-            f"https://{name_clean}.org",
-            f"https://{name_clean}.co",
-            f"https://{name_clean}.io",
-        ]
-        
-        for pattern in patterns:
-            try:
-                resp = requests.head(pattern, timeout=3, allow_redirects=True)
-                if resp.status_code == 200:
-                    logger.info(f"[WEBSITE] Domain guess successful: {pattern}")
-                    return pattern
-            except:
-                pass
-        
-        return None
-    
-    def extract_website_comprehensive(self, business_name: str, location: str, maps_url: str = None) -> str:
-        """Main method to extract website using all strategies"""
-        
-        # Strategy 1: From Maps Details
-        if maps_url:
-            website = self.extract_from_maps_details(maps_url)
-            if website:
-                return website
-        
-        # Strategy 2: Google Search
-        website = self.search_official_website(business_name, location)
-        if website:
-            return website
-        
-        # Strategy 3: Domain Guessing
-        website = self.extract_from_domain_guess(business_name)
-        if website:
-            return website
-        
+                    continue
+                    
+        except: pass
         return "N/A"
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ENHANCED EMAIL PERSONALIZATION - HUMAN-LIKE
-# ═══════════════════════════════════════════════════════════════════════════
-class SmartEmailPersonalizer:
-    """Generates human-like personalized emails"""
-    
-    def __init__(self):
-        self.conversation_templates = {
-            "low_rating": [
-                "I noticed your current rating is {rating}. As someone who cares about local businesses, I'd love to share how we've helped similar businesses improve their online presence.",
-                "With a current rating of {rating}, you might be looking for ways to attract more customers. Our solution has helped businesses exactly in your situation.",
-                "I understand that maintaining a good rating is challenging. We specialize in helping businesses like yours improve their reputation and customer satisfaction."
-            ],
-            "high_rating": [
-                "Congratulations on your {rating} rating! I've been impressed with what I've seen about {business_name}. I believe I can help you take your business to the next level.",
-                "Your {rating} rating caught my attention. It's clear you're doing something right, and I'd love to show you how we can amplify your success.",
-                "I've been following businesses in {location}, and your {rating} rating stands out. I have some ideas that could help you capitalize on this momentum."
-            ],
-            "neutral": [
-                "I came across {business_name} in {location} and was intrigued by your service offering. I think there's an opportunity we should discuss.",
-                "While researching businesses in {location}, your profile stood out. I'd love to share some insights that could benefit {business_name}.",
-                "I've been analyzing the market in {location}, and I believe {business_name} has untapped potential. Would you be open to a conversation?"
-            ]
-        }
-        
-        self.opening_lines = [
-            "Hope you're having a great week!",
-            "I hope this message finds you well.",
-            "I wanted to reach out personally because...",
-            "After reviewing your business profile...",
-            "I've been following your journey and...",
-            "Your approach to serving {location} caught my attention because..."
-        ]
-        
-        self.closing_lines = [
-            "Would love to hop on a quick call if you're open to it.",
-            "Happy to share more details - just let me know when works for you.",
-            "No pressure at all, just wanted to plant a seed for future reference.",
-            "Either way, keep up the great work you're doing!",
-            "Looking forward to potentially working together."
-        ]
-    
-    def analyze_business_context(self, business_name: str, niche: str, rating: str) -> dict:
-        """Analyze business context for personalization"""
-        context = {
-            "has_low_rating": False,
-            "has_high_rating": False,
-            "rating_value": None,
-            "sentiment": "neutral"
-        }
-        
-        try:
-            rating_val = float(rating) if rating != "N/A" else None
-            if rating_val:
-                context["rating_value"] = rating_val
-                if rating_val <= 3.5:
-                    context["has_low_rating"] = True
-                    context["sentiment"] = "needs_improvement"
-                elif rating_val >= 4.5:
-                    context["has_high_rating"] = True
-                    context["sentiment"] = "successful"
-        except:
-            pass
-        
-        return context
-    
-    def generate_personalized_email(self, business_name: str, niche: str, 
-                                   rating: str, location: str,
-                                   template_subject: str, template_body: str) -> Tuple[str, str, str]:
-        """Generate fully personalized email"""
-        
-        context = self.analyze_business_context(business_name, niche, rating)
-        
-        # Choose template based on rating
-        if context["has_low_rating"]:
-            rating_template = random.choice(self.conversation_templates["low_rating"])
-            rating_text = f"{context['rating_value']} out of 5"
-        elif context["has_high_rating"]:
-            rating_template = random.choice(self.conversation_templates["high_rating"])
-            rating_text = f"{context['rating_value']} stars"
-        else:
-            rating_template = random.choice(self.conversation_templates["neutral"])
-            rating_text = "good"
-        
-        # Personalization line
-        personalization_line = rating_template.format(
-            business_name=business_name,
-            location=location,
-            rating=rating_text
+# ══════════════════════════════════════════════
+#   3. AI KEYWORD GENERATOR & PERSONALIZER
+# ══════════════════════════════════════════════
+def generate_ai_keywords(base_kw, location, used_kws):
+    fallback = [f"best {base_kw}", f"top {base_kw}", f"{base_kw} services", f"affordable {base_kw}", f"{base_kw} agency", f"{base_kw} near me", f"{base_kw} company", f"{base_kw} experts"]
+    if not GROQ_API_KEY: return fallback
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        # UPGRADED: Now asks for 100+ keywords to ensure massive pool
+        prompt = f"I am searching for '{base_kw}' in '{location}'. Used keywords: {list(used_kws)}. Generate 100 NEW, highly related search terms/categories. Return ONLY a comma-separated list."
+        res = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama3-8b-8192",
+            temperature=0.7,
         )
-        
-        # Generate unique opening
-        opening = random.choice(self.opening_lines).format(location=location)
-        
-        # Generate closing
-        closing = random.choice(self.closing_lines)
-        
-        # Use AI for advanced personalization if available
-        if GROQ_API_KEY:
-            try:
-                client = Groq(api_key=GROQ_API_KEY)
-                prompt = f"""Create a highly personalized, human-like cold email for:
-                
-Business: {business_name}
-Niche: {niche}
-Location: {location}
-Rating: {rating}
-Personalization angle: {personalization_line}
+        text = res.choices[0].message.content
+        new_kws = [k.strip() for k in text.split(',') if k.strip() and k.strip().lower() not in used_kws]
+        return new_kws if new_kws else fallback
+    except:
+        return fallback
 
-Requirements:
-- Natural, conversational tone (like a real person wrote it)
-- No spammy phrases or excessive exclamation marks
-- Specific to their business/location
-- Include the personalization line naturally
-- Keep it under 150 words
-- Be respectful and not pushy
-
-Return ONLY the email body text. No subject line, no explanations."""
-                
-                resp = client.chat.completions.create(
-                    messages=[{"role": "user", "content": prompt}],
-                    model="llama3-8b-8192",
-                    temperature=0.8,
-                    max_tokens=400
-                )
-                
-                ai_body = resp.choices[0].message.content
-                
-                # Generate personalized subject
-                subject_prompt = f"""Generate a short, compelling subject line for an email to {business_name} ({niche} in {location}).
-The email is friendly and helpful, not salesy.
-Return ONLY the subject line text."""
-                
-                resp_subj = client.chat.completions.create(
-                    messages=[{"role": "user", "content": subject_prompt}],
-                    model="llama3-8b-8192",
-                    temperature=0.7,
-                    max_tokens=60
-                )
-                
-                ai_subject = resp_subj.choices[0].message.content
-                
-                return ai_subject, ai_body, personalization_line
-                
-            except Exception as e:
-                logger.warning(f"[EMAIL] AI personalization failed: {e}")
+def personalize_email(lead_name, niche, template_subject, template_body, rating):
+    if not GROQ_API_KEY: return template_subject, template_body, ""
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        # UPGRADED: Now generates a specific personalization line based on rating/niche
+        prompt = f"""
+        You are an expert cold email copywriter. Personalize this email for a business.
+        Business Name: {lead_name}
+        Niche: {niche}
+        Current Rating: {rating} (If below 4.0, mention helping them improve it. If high, compliment it).
+        Original Subject: {template_subject}
+        Original Body: {template_body}
         
-        # Fallback to template-based personalization
-        subject = template_subject.replace("{name}", business_name).replace("{niche}", niche)
-        body = f"""{opening}
+        Return ONLY a valid JSON object with keys:
+        "subject" (personalized subject),
+        "body" (personalized HTML body),
+        "personalization_line" (A single, highly personalized opening sentence based on their business and rating).
+        """
+        res = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama3-8b-8192",
+            temperature=0.5,
+        )
+        content = res.choices[0].message.content
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group(0))
+            return data.get("subject", template_subject), data.get("body", template_body), data.get("personalization_line", "")
+        return template_subject, template_body, ""
+    except Exception as e:
+        return template_subject, template_body, ""
 
-{personalization_line}
-
-{template_body.format(name=business_name, niche=niche, location=location)}
-
-{closing}
-
-Best regards,
-[Your Name]"""
+# ══════════════════════════════════════════════
+#   4. MASTER EXECUTION THREAD (Scrape + DB + Email)
+# ══════════════════════════════════════════════
+def run_job_thread(job_id, data):
+    try:
+        location = data.get('location')
+        base_keyword = data.get('keyword')
+        max_leads = min(int(data.get('max_leads', 10)), 200)
+        max_rating = data.get('max_rating')
+        webhook_url = data.get('webhook_url')
+        db_webhook_url = data.get('db_webhook_url') # NEW: DB Webhook
+        templates = data.get('templates', [])
         
-        return subject, body, personalization_line
+        maps_scraper = GoogleMapsScraper()
+        email_lib = DeepEmailExtractor()
+        db = GoogleSheetsDB(db_webhook_url)
+        
+        jobs[job_id] = {'status': 'scraping', 'count': 0, 'leads': [], 'status_text': 'Starting AI Keyword Generation...'}
+        
+        # [DB] Initialize Sheets & Config
+        if db_webhook_url:
+            db.send_action("init", {})
+            db.send_action("update_config", {
+                "keyword_seed": base_keyword, "location": location, "target_leads": max_leads,
+                "min_rating": "", "max_rating": max_rating or "", "email_required": "true", "status": "running"
+            })
+            db.log("System Start", f"Started job for {base_keyword} in {location}")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# NEGATIVE REVIEW TARGETING - PRIORITIZE BAD RATINGS
-# ═══════════════════════════════════════════════════════════════════════════
-class NegativeReviewPrioritizer:
-    """Prioritizes businesses with bad ratings and negative reviews"""
-    
-    @staticmethod
-    def extract_negative_sentiment(text: str) -> float:
-        """Extract negative sentiment score from text"""
-        negative_words = [
-            'bad', 'poor', 'terrible', 'awful', 'horrible', 'disappointing',
-            'worst', 'never', 'complaint', 'issue', 'problem', 'mistake',
-            'rude', 'unprofessional', 'late', 'expensive', 'overpriced',
-            'broken', 'damage', 'refund', 'sorry', 'apologize'
-        ]
+        seen_names = set()
+        used_keywords = set()
+        pending_keywords = [base_keyword]
         
-        text_lower = text.lower()
-        negative_count = sum(1 for word in negative_words if word in text_lower)
-        
-        # Normalize to 0-1 score
-        return min(negative_count / 20, 1.0)
-    
-    @staticmethod
-    def prioritize_businesses(businesses: List[dict], max_rating_threshold: float = None) -> List[dict]:
-        """Sort businesses by rating (lowest first) and negative sentiment"""
-        
-        def get_priority_score(business: dict) -> float:
-            rating = business.get('Rating', 'N/A')
-            try:
-                rating_val = float(rating) if rating != "N/A" else 5.0
-                # Lower rating = higher priority (lower score = higher priority)
-                # Normalize: 1.0 is worst, 5.0 is best
-                rating_priority = 1.0 - ((rating_val - 1.0) / 4.0) if rating_val >= 1.0 else 1.0
-            except:
-                rating_priority = 0.5
+        # --- PHASE 1: STRICT SCRAPING (UNTIL TARGET HIT) ---
+        while len(jobs[job_id]['leads']) < max_leads:
             
-            # Check for negative review mentions
-            description = business.get('Description', '') or business.get('Snippet', '')
-            negative_score = NegativeReviewPrioritizer.extract_negative_sentiment(description)
+            if not pending_keywords:
+                jobs[job_id]['status_text'] = f"Generating 100+ new keywords for '{base_keyword}'..."
+                new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
+                pending_keywords.extend(new_kws)
+                
+                # [DB] Save generated keywords
+                for kw in new_kws:
+                    db.send_action("add_keyword", {"keyword": kw, "source_seed": base_keyword, "status": "pending"})
+                
+            current_kw = pending_keywords.pop(0)
+            used_keywords.add(current_kw.lower())
             
-            # Combine: 70% rating, 30% negative sentiment
-            priority = (rating_priority * 0.7) + (negative_score * 0.3)
-            return -priority  # Negative for ascending sort (highest priority first)
+            jobs[job_id]['status_text'] = f"Searching Google Maps for: {current_kw}..."
+            raw_leads = maps_scraper.fetch_batch(current_kw, location)
+            
+            if not raw_leads:
+                continue 
+            
+            for lead in raw_leads:
+                if len(jobs[job_id]['leads']) >= max_leads:
+                    break # Target Hit!
+                    
+                if lead['Name'] in seen_names:
+                    continue
+                
+                # [DB] Save raw scraped business
+                db.send_action("add_scraped", {
+                    "business_name": lead['Name'], "address": lead['Address'], "phone": lead['Phone'],
+                    "rating": lead['Rating'], "review_count": "N/A", "website": lead['Website'],
+                    "keyword": current_kw, "status": "scraped"
+                })
+
+                # Apply Rating Filter
+                if max_rating and lead['Rating'] != "N/A":
+                    try:
+                        if float(lead['Rating']) > float(max_rating): continue
+                    except: pass
+
+                if lead['Website'] == "N/A":
+                    continue 
+                    
+                jobs[job_id]['status_text'] = f"Deep searching email for: {lead['Name']}..."
+                extracted_email = email_lib.get_email(lead['Website'])
+                
+                if extracted_email == "N/A":
+                    continue 
+                
+                # [DB] Save Email Lead
+                db.send_action("add_email_lead", {
+                    "business_name": lead['Name'], "website": lead['Website'],
+                    "email": extracted_email, "source_page": lead['Website'], "status": "qualified"
+                })
+                
+                # [DB] Move to Qualified Leads
+                db.send_action("add_qualified", {
+                    "business_name": lead['Name'], "email": extracted_email, "website": lead['Website'],
+                    "rating": lead['Rating'], "keyword": current_kw, "personalization_line": "Pending AI...", "email_sent": "no"
+                })
+
+                lead['Email'] = extracted_email
+                seen_names.add(lead['Name'])
+                jobs[job_id]['leads'].append(lead)
+                jobs[job_id]['count'] = len(jobs[job_id]['leads'])
+                
+                jobs[job_id]['status_text'] = f"🎯 Found {jobs[job_id]['count']}/{max_leads} valid emails! (Latest: {lead['Email']})"
+                
+            time.sleep(1)
+            
+        final_leads = jobs[job_id]['leads']
         
-        # Filter by max rating if specified
-        if max_rating_threshold:
-            filtered = []
-            for biz in businesses:
+        # [DB] Update Config to Stopped
+        db.send_action("update_config", {
+            "keyword_seed": base_keyword, "location": location, "target_leads": max_leads,
+            "min_rating": "", "max_rating": max_rating or "", "email_required": "true", "status": "stopped"
+        })
+        db.log("Scraping Stopped", f"Target reached. Total qualified: {len(final_leads)}")
+        
+        # --- PHASE 2: AUTOMATED EMAIL SENDING ---
+        if webhook_url and templates and len(final_leads) > 0:
+            jobs[job_id]['status'] = 'sending_emails'
+            jobs[job_id]['total_to_send'] = len(final_leads)
+            emails_sent = 0
+            
+            for lead in final_leads:
+                jobs[job_id]['status_text'] = f"Sending personalized email {emails_sent+1}/{jobs[job_id]['total_to_send']} to {lead['Email']}..."
+                
+                template = random.choice(templates)
+                # UPGRADED: Now generates personalization line
+                p_subject, p_body, p_line = personalize_email(lead['Name'], base_keyword, template['subject'], template['body'], lead['Rating'])
+                
+                payload = {"to": lead['Email'], "subject": p_subject, "body": p_body}
                 try:
-                    rating_val = float(biz.get('Rating', 'N/A')) if biz.get('Rating') != "N/A" else 5.0
-                    if rating_val <= max_rating_threshold:
-                        filtered.append(biz)
-                except:
-                    filtered.append(biz)
-            businesses = filtered
+                    requests.post(webhook_url, json=payload, timeout=10)
+                    emails_sent += 1
+                    jobs[job_id]['emails_sent'] = emails_sent
+                    
+                    # [DB] Update Email Sent Status & Personalization Line
+                    db.send_action("update_email_sent", {"email": lead['Email'], "personalization_line": p_line})
+                    db.log("Email Sent", f"Sent to {lead['Email']}")
+                except Exception as e:
+                    print(f"Failed to send email to {lead['Email']}: {e}")
+                
+                if emails_sent < jobs[job_id]['total_to_send']:
+                    delay = random.randint(60, 120)
+                    for i in range(delay, 0, -1):
+                        jobs[job_id]['status_text'] = f"Anti-Spam: Waiting {i}s before sending next email..."
+                        time.sleep(1)
         
-        # Sort by priority (lowest ratings first)
-        businesses.sort(key=get_priority_score)
+        # --- FINISHED ---
+        jobs[job_id]['status'] = 'done'
+        jobs[job_id]['status_text'] = 'Process Completed Successfully!'
+        db.log("Job Complete", "All tasks finished successfully.")
         
-        logger.info(f"[PRIORITY] Prioritized {len(businesses)} businesses (worst ratings first)")
-        return businesses
+    except Exception as e:
+        jobs[job_id] = {'status': 'error', 'error': str(e)}
+        if 'db' in locals(): db.log("Error", str(e))
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ENHANCED GOOGLE MAPS SCRAPER (with priority extraction)
-# ═══════════════════════════════════════════════════════════════════════════
-class EnhancedMapsScraper:
-    """Enhanced scraper with negative review prioritization"""
-    
-    def __init__(self):
-        self.website_extractor = EnhancedWebsiteExtractor()
-        self.session = requests.Session()
-    
-    def scrape_businesses(self, keyword: str, location: str) -> List[dict]:
-        """Scrape businesses and extract negative review data"""
-        
-        businesses = []
-        query = urllib.parse.quote_plus(f"{keyword} {location}")
-        url = f"https://www.google.com/maps/search/{query}/"
-        
-        try:
-            resp = self.session.get(url, headers=get_headers(), timeout=15, verify=False)
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            
-            # Extract businesses with rating data
-            business_patterns = [
-                r'"name":"([^"]+)".*?"rating":([0-9.]+).*?"user_ratings_total":(\d+)',
-                r'"title":"([^"]+)".*?"rating":([0-9.]+)',
-            ]
-            
-            for pattern in business_patterns:
-                matches = re.findall(pattern, resp.text)
-                for match in matches:
-                    business = {
-                        'Name': match[0],
-                        'Rating': match[1] if len(match) > 1 else "N/A",
-                        'ReviewCount': match[2] if len(match) > 2 else "0",
-                        'Address': location,
-                        'Category': keyword,
-                        'Phone': "N/A",
-                        'Website': "N/A",
-                        'Maps_Link': f"https://www.google.com/maps/search/{urllib.parse.quote_plus(match[0] + ' ' + location)}/"
-                    }
-                    businesses.append(business)
-            
-            # Extract from HTML elements
-            for item in soup.select('[role="article"], .section-result, .Nv2PK'):
-                name_elem = item.select_one('.fontHeadlineSmall, h3, [role="heading"]')
-                if not name_elem:
-                    continue
-                
-                name = name_elem.get_text(strip=True)
-                if len(name) < 3:
-                    continue
-                
-                rating = "N/A"
-                rating_elem = item.select_one('.fontBodyMedium span')
-                if rating_elem:
-                    rating_text = rating_elem.get_text(strip=True)
-                    rating_match = re.search(r'([0-9.]+)', rating_text)
-                    if rating_match:
-                        rating = rating_match.group(1)
-                
-                business = {
-                    'Name': name,
-                    'Rating': rating,
-                    'ReviewCount': "N/A",
-                    'Address': location,
-                    'Category': keyword,
-                    'Phone': "N/A",
-                    'Website': "N/A",
-                    'Maps_Link': f"https://www.google.com/maps/search/{urllib.parse.quote_plus(name + ' ' + location)}/"
-                }
-                businesses.append(business)
-                
-        except Exception as e:
-            logger.error(f"[SCRAPE] Error: {e}")
-        
-        # Prioritize businesses with bad ratings
-        businesses = NegativeReviewPrioritizer.prioritize_businesses(businesses)
-        
-        logger.info(f"[SCRAPE] Scraped {len(businesses)} businesses for '{keyword}'")
-        return businesses[:50]  # Limit per keyword
-
-# ═══════════════════════════════════════════════════════════════════════════
-# MULTI-KEYWORD JOB MANAGER
-# ═══════════════════════════════════════════════════════════════════════════
-class MultiKeywordJobManager:
-    """Manages jobs with multiple keyword sets"""
-    
-    def __init__(self):
-        self.active_jobs = {}
-        self.scheduler = BackgroundScheduler(timezone=pytz.timezone('Asia/Dhaka'))
-        self.scheduler.start()
-    
-    def create_job_group(self, keyword_sets: List[dict]) -> str:
-        """Create a new job group with multiple keyword sets"""
-        job_group_id = str(uuid.uuid4())[:8]
-        
-        for kw_set in keyword_sets:
-            db.add_keyword_set(job_group_id, kw_set)
-        
-        logger.info(f"[JOB] Created job group {job_group_id} with {len(keyword_sets)} keyword sets")
-        return job_group_id
-    
-    def schedule_job(self, job_group_id: str, hour: int, minute: int, am_pm: str) -> int:
-        """Schedule a job for BD time"""
-        bd_tz = pytz.timezone('Asia/Dhaka')
-        now = datetime.now(bd_tz)
-        
-        # Convert to 24-hour format
-        hour_24 = hour if am_pm.upper() == 'AM' else hour + 12
-        if hour_24 == 24:
-            hour_24 = 0
-        
-        # Set schedule time
-        schedule_time = now.replace(hour=hour_24, minute=minute, second=0, microsecond=0)
-        
-        # If time has passed today, schedule for tomorrow
-        if schedule_time <= now:
-            schedule_time += timedelta(days=1)
-        
-        # Store in database
-        scheduled_id = db.add_scheduled_job(job_group_id, schedule_time)
-        
-        # Add to scheduler
-        self.scheduler.add_job(
-            func=self.execute_scheduled_job,
-            trigger=CronTrigger(hour=hour_24, minute=minute, timezone=bd_tz),
-            args=[job_group_id, scheduled_id],
-            id=f"job_{scheduled_id}",
-            replace_existing=True
-        )
-        
-        logger.info(f"[SCHEDULER] Scheduled job {job_group_id} for {schedule_time.strftime('%Y-%m-%d %H:%M')} BD time")
-        return scheduled_id
-    
-    def execute_scheduled_job(self, job_group_id: str, scheduled_id: int):
-        """Execute a scheduled job"""
-        logger.info(f"[SCHEDULER] Executing scheduled job {job_group_id}")
-        
-        # Get pending keyword sets
-        pending_sets = db.get_pending_keyword_sets(job_group_id)
-        
-        if not pending_sets:
-            logger.info(f"[SCHEDULER] No pending keyword sets for {job_group_id}")
-            db.update_scheduled_job_status(scheduled_id, 'completed')
-            return
-        
-        # Start processing
-        db.update_scheduled_job_status(scheduled_id, 'running')
-        
-        # Process each keyword set sequentially
-        for kw_set in pending_sets:
-            if kw_set['status'] != 'pending':
-                continue
-            
-            logger.info(f"[JOB] Processing keyword set: {kw_set['keyword']} in {kw_set['location']}")
-            
-            # Create job data
-            job_data = {
-                'job_group_id': job_group_id,
-                'keyword': kw_set['keyword'],
-                'location': kw_set['location'],
-                'max_leads': kw_set['target_leads'],
-                'max_rating': kw_set['max_rating'],
-                'min_rating': kw_set['min_rating']
-            }
-            
-            # Run the job (can be async)
-            success = self.run_single_keyword_job(job_data)
-            
-            if success:
-                db.update_keyword_set_status(kw_set['id'], 'completed', kw_set.get('leads_found', 0))
-            else:
-                db.update_keyword_set_status(kw_set['id'], 'failed')
-        
-        db.update_scheduled_job_status(scheduled_id, 'completed')
-    
-    def run_single_keyword_job(self, job_data: dict) -> bool:
-        """Run a single keyword set job"""
-        # This would integrate with your existing run_job_thread function
-        # For now, return True
-        return True
-
-# ═══════════════════════════════════════════════════════════════════════════
-# FLASK APP WITH ENHANCED ENDPOINTS
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════
+#   FLASK DASHBOARD & API
+# ══════════════════════════════════════════════
 flask_app = Flask(__name__)
-job_manager = MultiKeywordJobManager()
-enhanced_keyword_engine = EnhancedKeywordEngine()
-email_personalizer = SmartEmailPersonalizer()
+jobs = {}
 
-# Store active jobs
-jobs: dict = {}
-latest_job_id: str = None
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LeadGen Pro | Auto Emailer & DB</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+<style>
+*{box-sizing:border-box}
+body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;min-height:100vh}
+.card{background:rgba(15,23,42,0.85);border:1px solid rgba(99,102,241,0.12);border-radius:16px}
+.card-hover{transition:all .2s}
+.card-hover:hover{border-color:rgba(99,102,241,0.35);transform:translateY(-2px)}
+.btn-p{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;font-weight:600;cursor:pointer;transition:all .2s;border:none}
+.btn-p:hover{filter:brightness(1.12);transform:translateY(-1px);box-shadow:0 6px 20px rgba(79,70,229,0.4)}
+.btn-p:disabled{opacity:.45;cursor:not-allowed;transform:none;filter:none}
+.btn-g{background:linear-gradient(135deg,#059669,#0d9488);color:#fff;font-weight:600;cursor:pointer;transition:all .2s;border:none}
+.btn-g:hover{filter:brightness(1.12);transform:translateY(-1px);box-shadow:0 6px 20px rgba(5,150,105,0.4)}
+.btn-b{background:linear-gradient(135deg,#2563eb,#3b82f6);color:#fff;font-weight:600;cursor:pointer;transition:all .2s;border:none}
+.btn-b:hover{filter:brightness(1.12);transform:translateY(-1px);box-shadow:0 6px 20px rgba(37,99,235,0.4)}
+.inp{background:#0f172a;border:1px solid #1e293b;color:#e2e8f0;border-radius:10px;padding:11px 15px;font-size:13px;width:100%;transition:border .2s;outline:none}
+.inp:focus{border-color:#4f46e5;box-shadow:0 0 0 3px rgba(79,70,229,0.12)}
+.tab{border-radius:9px;padding:9px 18px;font-size:12px;font-weight:600;cursor:pointer;transition:all .2s;border:1px solid transparent;color:#64748b;background:transparent}
+.tab.on{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;box-shadow:0 3px 12px rgba(79,70,229,0.35)}
+.tab:not(.on):hover{background:rgba(79,70,229,0.08);color:#a5b4fc}
+.prog{height:4px;background:#1e293b;border-radius:99px;overflow:hidden}
+.prog-fill{height:100%;border-radius:99px;background:linear-gradient(90deg,#4f46e5,#7c3aed);transition:width .6s ease}
+.pill{padding:1px 7px;border-radius:6px;font-size:11px;font-weight:600;display:inline-block}
+.pg{background:rgba(5,150,105,0.12);color:#34d399}
+.pr{background:rgba(239,68,68,0.09);color:#f87171}
+.pb{background:rgba(59,130,246,0.1);color:#60a5fa}
+.spin{animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.fade{animation:fd .25s ease}
+@keyframes fd{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.blink{animation:bl 1.4s infinite}
+@keyframes bl{0%,100%{opacity:1}50%{opacity:.25}}
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-thumb{background:#334155;border-radius:3px}
+</style>
+</head>
+<body>
+
+<nav style="background:rgba(6,11,24,.96);border-bottom:1px solid rgba(99,102,241,0.1);backdrop-filter:blur(10px)" class="sticky top-0 z-40 px-4 py-3 flex items-center justify-between">
+  <div class="flex items-center gap-3">
+    <div class="btn-p w-9 h-9 rounded-xl flex items-center justify-center text-sm shadow-lg"><i class="fa-solid fa-bolt"></i></div>
+    <div>
+      <div class="font-bold text-white text-sm">LeadGen Pro <span class="text-indigo-400">Auto</span></div>
+      <div class="text-xs text-slate-500">Scrape, Store & Send Personalized Emails</div>
+    </div>
+  </div>
+</nav>
+
+<div class="max-w-5xl mx-auto px-4 py-6">
+
+  <!-- STATS -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-white" id="st">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-users text-indigo-400 text-xs"></i>Valid Leads</div></div>
+    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-emerald-400" id="se">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-envelope text-emerald-400 text-xs"></i>Emails Found</div></div>
+    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-sky-400" id="sp">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-phone text-sky-400 text-xs"></i>Phones</div></div>
+    <div class="card card-hover p-4 fade"><div class="text-2xl font-bold text-violet-400" id="sw">0</div><div class="text-xs text-slate-500 mt-1 flex items-center gap-1"><i class="fa-solid fa-globe text-violet-400 text-xs"></i>Websites</div></div>
+  </div>
+
+  <!-- TABS -->
+  <div class="flex gap-2 mb-5 overflow-x-auto pb-1">
+    <button class="tab on" id="tab-search" onclick="showTab('search')"><i class="fa-solid fa-search mr-1.5"></i>Search & Run</button>
+    <button class="tab" id="tab-database" onclick="showTab('database')"><i class="fa-solid fa-database mr-1.5"></i>Connect Database</button>
+    <button class="tab" id="tab-connect" onclick="showTab('connect')"><i class="fa-solid fa-paper-plane mr-1.5"></i>Connect Email</button>
+    <button class="tab" id="tab-templates" onclick="showTab('templates')"><i class="fa-solid fa-envelope-open-text mr-1.5"></i>Templates</button>
+    <button class="tab" id="tab-history" onclick="showTab('history')"><i class="fa-solid fa-history mr-1.5"></i>History</button>
+  </div>
+
+  <!-- SEARCH PANE -->
+  <div id="pane-search" class="fade">
+    <div class="card p-6 mb-4">
+      <h2 class="font-bold text-white text-sm mb-5 flex items-center gap-2">
+        <span class="btn-p w-7 h-7 rounded-lg flex items-center justify-center text-xs"><i class="fa-solid fa-crosshairs"></i></span>
+        Target Parameters
+      </h2>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-5">
+        <div><label class="text-xs text-slate-500 mb-1.5 block">📍 Location *</label><input id="m-loc" class="inp" placeholder="e.g. New York"></div>
+        <div><label class="text-xs text-slate-500 mb-1.5 block">🔍 Keyword *</label><input id="m-kw" class="inp" placeholder="e.g. dentist"></div>
+        <div><label class="text-xs text-slate-500 mb-1.5 block">🔢 Exact Target (Max 200)</label><input id="m-count" type="number" max="200" value="10" class="inp"></div>
+        <div><label class="text-xs text-slate-500 mb-1.5 block">⭐ Max Rating (Optional - For Bad Reviews)</label><input id="m-rating" type="number" step="0.1" class="inp" placeholder="e.g. 3.5"></div>
+      </div>
+      <div class="p-3 mb-4 rounded-xl text-xs" style="background:rgba(239,68,68,0.07);border:1px solid rgba(239,68,68,0.2);color:#f87171">
+        <i class="fa-solid fa-shield-halved mr-1"></i> <b>Strict Mode:</b> Only leads with valid emails are counted. AI will auto-expand keywords until target is reached.
+      </div>
+      <button onclick="startJob()" id="btn-run" class="btn-p w-full py-3 rounded-xl text-sm"><i class="fa-solid fa-play mr-2"></i>Start Scraping & Automation</button>
+    </div>
+
+    <!-- STATUS -->
+    <div id="sbox" class="hidden card p-5 mb-4 fade">
+      <div class="flex items-center gap-3 mb-3">
+        <i id="si" class="fa-solid fa-circle-notch spin text-indigo-400 text-xl"></i>
+        <span id="stxt" class="font-semibold text-white text-sm">Processing...</span>
+      </div>
+      <div class="prog mb-2"><div class="prog-fill" id="sbar" style="width:0%"></div></div>
+      <div id="sdet" class="text-xs text-slate-400 mb-3 font-mono bg-slate-900 p-2 rounded"></div>
+      <button id="dlbtn" onclick="doDL()" class="hidden btn-g w-full py-3 rounded-xl text-sm"><i class="fa-solid fa-download mr-2"></i>Download Leads CSV</button>
+    </div>
+
+    <!-- PREVIEW TABLE -->
+    <div id="pvbox" class="hidden card p-5 fade">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="font-bold text-white text-sm flex items-center gap-2">
+          <i class="fa-solid fa-table-cells text-indigo-400 text-xs"></i>
+          Preview <span id="pvcnt" class="text-slate-500 font-normal text-xs"></span>
+        </h3>
+        <button onclick="doDL()" class="btn-g px-4 py-2 rounded-lg text-xs">
+          <i class="fa-solid fa-download mr-1"></i>CSV
+        </button>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-xs border-collapse">
+          <thead><tr id="th" class="text-slate-500"></tr></thead>
+          <tbody id="tb"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- [NEW] DATABASE PANE -->
+  <div id="pane-database" class="hidden fade">
+    <div class="card p-6">
+      <h2 class="font-bold text-white text-sm mb-4"><i class="fa-solid fa-database text-blue-400 mr-2"></i>Connect Google Sheets Database</h2>
+      <p class="text-xs text-slate-400 mb-4 leading-relaxed">
+        Store all generated keywords, scraped businesses, emails, and logs automatically in Google Sheets.<br>
+        1. Go to <a href="https://script.google.com" target="_blank" class="text-blue-400 underline">script.google.com</a> and create a New Project.<br>
+        2. Copy and paste the script below.<br>
+        3. Click <b>Deploy > New Deployment</b>. Select type <b>Web app</b>.<br>
+        4. Set "Who has access" to <b>Anyone</b>. Click Deploy and copy the Web App URL.
+      </p>
+      
+      <div class="relative mb-5">
+        <button onclick="copyScript()" class="absolute top-2 right-2 bg-slate-800 hover:bg-slate-700 text-white text-xs py-1 px-3 rounded border border-slate-600 transition-colors z-10">Copy Script</button>
+        <textarea id="db-script-code" readonly class="inp font-mono text-xs h-48" style="color:#93c5fd">
+function doPost(e) {
+  var lock = LockService.getScriptLock();
+  lock.tryLock(10000);
+  try {
+    var payload = JSON.parse(e.postData.contents);
+    var action = payload.action;
+    var data = payload.data;
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+    function getOrCreateSheet(name, headers) {
+      var sheet = ss.getSheetByName(name);
+      if (!sheet) {
+        sheet = ss.insertSheet(name);
+        sheet.appendRow(headers);
+        sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+      }
+      return sheet;
+    }
+
+    if (action === "init") {
+      getOrCreateSheet("Config", ["keyword_seed", "location", "target_leads", "min_rating", "max_rating", "email_required", "status"]);
+      getOrCreateSheet("Generated_Keywords", ["keyword", "source_seed", "status"]);
+      getOrCreateSheet("Scraped_Businesses", ["business_name", "address", "phone", "rating", "review_count", "website", "keyword", "status"]);
+      getOrCreateSheet("Email_Leads", ["business_name", "website", "email", "source_page", "status"]);
+      getOrCreateSheet("Qualified_Leads", ["business_name", "email", "website", "rating", "keyword", "personalization_line", "email_sent"]);
+      getOrCreateSheet("Logs", ["timestamp", "action", "details"]);
+      return ContentService.createTextOutput(JSON.stringify({status: "success"})).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    if (action === "log") {
+      var sheet = ss.getSheetByName("Logs");
+      if(sheet) sheet.appendRow([data.timestamp, data.action, data.details]);
+    }
+    else if (action === "add_keyword") {
+      var sheet = ss.getSheetByName("Generated_Keywords");
+      if(sheet) sheet.appendRow([data.keyword, data.source_seed, data.status]);
+    }
+    else if (action === "add_scraped") {
+      var sheet = ss.getSheetByName("Scraped_Businesses");
+      if(sheet) sheet.appendRow([data.business_name, data.address, data.phone, data.rating, data.review_count, data.website, data.keyword, data.status]);
+    }
+    else if (action === "add_email_lead") {
+      var sheet = ss.getSheetByName("Email_Leads");
+      if(sheet) sheet.appendRow([data.business_name, data.website, data.email, data.source_page, data.status]);
+    }
+    else if (action === "add_qualified") {
+      var sheet = ss.getSheetByName("Qualified_Leads");
+      if(sheet) sheet.appendRow([data.business_name, data.email, data.website, data.rating, data.keyword, data.personalization_line, data.email_sent]);
+    }
+    else if (action === "update_config") {
+       var sheet = ss.getSheetByName("Config");
+       if(sheet) {
+         sheet.clearContents();
+         sheet.appendRow(["keyword_seed", "location", "target_leads", "min_rating", "max_rating", "email_required", "status"]);
+         sheet.appendRow([data.keyword_seed, data.location, data.target_leads, data.min_rating, data.max_rating, data.email_required, data.status]);
+       }
+    }
+    else if (action === "update_email_sent") {
+       var sheet = ss.getSheetByName("Qualified_Leads");
+       if(sheet) {
+         var dataRange = sheet.getDataRange();
+         var values = dataRange.getValues();
+         for (var i = 1; i < values.length; i++) {
+           if (values[i][1] === data.email) { 
+             sheet.getRange(i + 1, 6).setValue(data.personalization_line);
+             sheet.getRange(i + 1, 7).setValue("yes");
+             break;
+           }
+         }
+       }
+    }
+    return ContentService.createTextOutput(JSON.stringify({status: "success"})).setMimeType(ContentService.MimeType.JSON);
+  } catch(e) {
+    return ContentService.createTextOutput(JSON.stringify({status: "error", message: e.toString()})).setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    lock.releaseLock();
+  }
+}
+function doGet(e) {
+  return ContentService.createTextOutput(JSON.stringify({status: "active", message: "Database Connected"})).setMimeType(ContentService.MimeType.JSON);
+}</textarea>
+      </div>
+      
+      <label class="text-xs text-slate-500 mb-1.5 block">🔗 Paste Database Web App URL Here:</label>
+      <input id="db-webhook-url" class="inp mb-4" placeholder="https://script.google.com/macros/s/AKfycb.../exec">
+      <button onclick="saveDBWebhook()" class="btn-b w-full py-2.5 rounded-xl text-sm"><i class="fa-solid fa-link mr-2"></i>Connect Database</button>
+    </div>
+  </div>
+
+  <!-- CONNECT EMAIL PANE -->
+  <div id="pane-connect" class="hidden fade">
+    <div class="card p-6">
+      <h2 class="font-bold text-white text-sm mb-4"><i class="fa-solid fa-paper-plane text-emerald-400 mr-2"></i>Google Apps Script Setup (Email Sender)</h2>
+      <p class="text-xs text-slate-400 mb-4 leading-relaxed">To send emails automatically from your Gmail, follow these steps:<br>1. Go to <a href="https://script.google.com" target="_blank" class="text-emerald-400 underline">script.google.com</a> and create a New Project.<br>2. Paste the code below.<br>3. Click <b>Deploy > New Deployment</b>. Select type <b>Web app</b>.<br>4. Set "Who has access" to <b>Anyone</b>. Click Deploy and copy the Web App URL.</p>
+      
+      <div class="relative mb-5">
+        <textarea readonly class="inp font-mono text-xs h-32" style="color:#a5b4fc">
+function doPost(e) {
+  try {
+    var data = JSON.parse(e.postData.contents);
+    MailApp.sendEmail({
+      to: data.to,
+      subject: data.subject,
+      htmlBody: data.body
+    });
+    return ContentService.createTextOutput(JSON.stringify({"status": "success"})).setMimeType(ContentService.MimeType.JSON);
+  } catch(err) {
+    return ContentService.createTextOutput(JSON.stringify({"status": "error", "message": err.toString()})).setMimeType(ContentService.MimeType.JSON);
+  }
+}</textarea>
+      </div>
+      
+      <label class="text-xs text-slate-500 mb-1.5 block">🔗 Paste Email Web App URL Here:</label>
+      <input id="webhook-url" class="inp mb-4" placeholder="https://script.google.com/macros/s/AKfycb.../exec">
+      <button onclick="saveWebhook()" class="btn-g w-full py-2.5 rounded-xl text-sm"><i class="fa-solid fa-save mr-2"></i>Save Email Connection</button>
+    </div>
+  </div>
+
+  <!-- TEMPLATES PANE -->
+  <div id="pane-templates" class="hidden fade">
+    <div class="card p-6 mb-4">
+      <h2 class="font-bold text-white text-sm mb-4"><i class="fa-solid fa-plus text-indigo-400 mr-2"></i>Add New Template</h2>
+      <input id="t-name" class="inp mb-3" placeholder="Template Name (e.g. SEO Pitch)">
+      <input id="t-sub" class="inp mb-3" placeholder="Subject (AI will personalize this)">
+      <textarea id="t-body" class="inp mb-3 h-24" placeholder="Email Body (HTML allowed. AI will personalize this based on lead info)"></textarea>
+      <button onclick="addTemplate()" class="btn-p w-full py-2.5 rounded-xl text-sm"><i class="fa-solid fa-plus mr-2"></i>Add Template</button>
+    </div>
+    <div class="card p-6">
+      <h2 class="font-bold text-white text-sm mb-4"><i class="fa-solid fa-list text-indigo-400 mr-2"></i>Saved Templates</h2>
+      <div id="t-list" class="space-y-3"></div>
+    </div>
+  </div>
+
+  <!-- HISTORY PANE -->
+  <div id="pane-history" class="hidden fade">
+    <div class="card p-6">
+      <div class="flex justify-between items-center mb-4">
+        <h2 class="font-bold text-white text-sm"><i class="fa-solid fa-history text-indigo-400 mr-2"></i>Task History</h2>
+        <button onclick="clearHistory()" class="text-xs text-red-400"><i class="fa-solid fa-trash"></i> Clear</button>
+      </div>
+      <div id="h-list" class="space-y-3"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let jid=null, templates=[], historyData=[], tableShown=false;
+
+window.onload=()=>{
+  document.getElementById('webhook-url').value = localStorage.getItem('webhook_url') || '';
+  document.getElementById('db-webhook-url').value = localStorage.getItem('db_webhook_url') || '';
+  templates = JSON.parse(localStorage.getItem('templates') || '[]');
+  historyData = JSON.parse(localStorage.getItem('history') || '[]');
+  renderTemplates();
+  renderHistory();
+};
+
+function showTab(t){
+  ['search','database','connect','templates','history'].forEach(x=>{
+    document.getElementById('pane-'+x).classList.add('hidden');
+    document.getElementById('tab-'+x).classList.remove('on');
+  });
+  document.getElementById('pane-'+t).classList.remove('hidden');
+  document.getElementById('tab-'+t).classList.add('on');
+}
+
+function copyScript() {
+  const code = document.getElementById('db-script-code');
+  code.select();
+  document.execCommand('copy');
+  alert("Database Script Copied!");
+}
+
+function saveWebhook(){
+  localStorage.setItem('webhook_url', document.getElementById('webhook-url').value.trim());
+  alert("Email Webhook Saved Successfully!");
+}
+
+function saveDBWebhook(){
+  localStorage.setItem('db_webhook_url', document.getElementById('db-webhook-url').value.trim());
+  alert("Database Webhook Saved Successfully!");
+}
+
+function addTemplate(){
+  const n = document.getElementById('t-name').value.trim();
+  const s = document.getElementById('t-sub').value.trim();
+  const b = document.getElementById('t-body').value.trim();
+  if(!n || !s || !b) return alert("Fill all fields!");
+  templates.push({name: n, subject: s, body: b});
+  localStorage.setItem('templates', JSON.stringify(templates));
+  document.getElementById('t-name').value=''; document.getElementById('t-sub').value=''; document.getElementById('t-body').value='';
+  renderTemplates();
+}
+
+function delTemplate(i){ templates.splice(i,1); localStorage.setItem('templates', JSON.stringify(templates)); renderTemplates(); }
+
+function renderTemplates(){
+  const el = document.getElementById('t-list');
+  if(!templates.length) return el.innerHTML = '<div class="text-xs text-slate-500 text-center">No templates added.</div>';
+  el.innerHTML = templates.map((t,i)=>`
+    <div class="p-4 rounded-xl bg-slate-800/50 border border-slate-700 relative">
+      <button onclick="delTemplate(${i})" class="absolute top-3 right-3 text-red-400 hover:text-red-300"><i class="fa-solid fa-trash"></i></button>
+      <div class="font-bold text-sm text-white mb-1">${t.name}</div>
+      <div class="text-xs text-indigo-300 mb-2">Sub: ${t.subject}</div>
+      <div class="text-xs text-slate-400 line-clamp-2">${t.body.replace(/</g,'&lt;')}</div>
+    </div>`).join('');
+}
+
+function renderHistory(){
+  const el = document.getElementById('h-list');
+  if(!historyData.length) return el.innerHTML = '<div class="text-xs text-slate-500 text-center">No history.</div>';
+  el.innerHTML = historyData.map(h=>`
+    <div class="p-3 rounded-xl bg-slate-800/50 border border-slate-700">
+      <div class="text-sm font-bold text-white">${h.loc} - ${h.kw}</div>
+      <div class="text-xs text-slate-400 mt-1">Target: ${h.target} | Date: ${h.date}</div>
+    </div>`).join('');
+}
+function clearHistory(){ historyData=[]; localStorage.removeItem('history'); renderHistory(); }
+
+function setSt(msg, state='load', pct=null){
+  document.getElementById('sbox').classList.remove('hidden');
+  document.getElementById('sdet').textContent = msg;
+  const ic = document.getElementById('si');
+  const txt = document.getElementById('stxt');
+  
+  if(state==='load'){ ic.className='fa-solid fa-circle-notch spin text-indigo-400 text-xl'; txt.textContent='Scraping Engine Running...'; }
+  else if(state==='email'){ ic.className='fa-solid fa-paper-plane blink text-sky-400 text-xl'; txt.textContent='Automation: Sending Emails...'; }
+  else if(state==='done'){ ic.className='fa-solid fa-circle-check text-emerald-400 text-xl'; txt.textContent='Task Completed!'; }
+  else { ic.className='fa-solid fa-circle-xmark text-red-400 text-xl'; txt.textContent='Error Occurred!'; }
+  
+  if(pct!=null) document.getElementById('sbar').style.width=pct+'%';
+}
+
+function updStats(leads){
+  document.getElementById('st').textContent=leads.length;
+  document.getElementById('se').textContent=leads.length; 
+  document.getElementById('sp').textContent=leads.filter(l=>l.Phone&&l.Phone!='N/A').length;
+  document.getElementById('sw').textContent=leads.filter(l=>l.Website&&l.Website!='N/A').length;
+}
+
+function showPV(leads){
+  if(!leads || !leads.length) return;
+  document.getElementById('pvbox').classList.remove('hidden');
+  document.getElementById('pvcnt').textContent='('+leads.length+' total, top 10)';
+  const keys=Object.keys(leads[0]);
+  document.getElementById('th').innerHTML=keys.map(k=>`<th class="px-3 py-2 text-left text-slate-500 font-medium whitespace-nowrap" style="border-bottom:1px solid rgba(255,255,255,0.05)">${k}</th>`).join('');
+  document.getElementById('tb').innerHTML=leads.slice(0,10).map(l=>
+    `<tr style="border-bottom:1px solid rgba(255,255,255,0.04)">${keys.map(k=>{
+      const v=(l[k]||'N/A').toString();
+      const cls=v==='N/A'?'pr':k==='Email'?'pg':k==='Phone'?'pb':'';
+      return `<td class="px-3 py-2.5 text-slate-300 max-w-xs whitespace-nowrap overflow-hidden text-ellipsis">${cls?`<span class="pill ${cls}">${v}</span>`:v}</td>`;
+    }).join('')}</tr>`
+  ).join('');
+}
+
+async function startJob(){
+  const loc=document.getElementById('m-loc').value.trim();
+  const kw=document.getElementById('m-kw').value.trim();
+  let count=parseInt(document.getElementById('m-count').value)||10;
+  if(count > 200) count = 200;
+  
+  if(!loc||!kw) return alert('Location & Keyword required!');
+  
+  const webhook = document.getElementById('webhook-url').value.trim();
+  const db_webhook = document.getElementById('db-webhook-url').value.trim();
+  
+  if(!db_webhook) alert("Notice: Database Webhook is missing. Data will not be saved to Google Sheets.");
+  if(!webhook && templates.length > 0) alert("Warning: Email Webhook URL is missing. Emails will NOT be sent.");
+  if(webhook && templates.length === 0) alert("Warning: No templates added. Emails will NOT be sent.");
+
+  setSt('Initializing AI Search Engine...','load',5);
+  document.getElementById('dlbtn').classList.add('hidden');
+  document.getElementById('pvbox').classList.add('hidden');
+  document.getElementById('btn-run').disabled=true;
+  tableShown = false;
+
+  const payload = {
+    location: loc, keyword: kw, max_leads: count,
+    max_rating: document.getElementById('m-rating').value || null,
+    webhook_url: webhook, db_webhook_url: db_webhook, templates: templates
+  };
+
+  try {
+      const r = await fetch('/api/scrape',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      const d = await r.json();
+      if(d.error){ setSt(d.error,'err'); document.getElementById('btn-run').disabled=false; return; }
+      jid = d.job_id;
+
+      historyData.unshift({loc: loc, kw: kw, target: count, date: new Date().toLocaleString()});
+      localStorage.setItem('history', JSON.stringify(historyData)); renderHistory();
+
+      const poll = async()=>{
+        try {
+            const r2 = await fetch('/api/status/'+jid); 
+            const d2 = await r2.json();
+            
+            if(d2.status==='scraping'){
+                setSt(d2.status_text, 'load', Math.max(5, (d2.count/count)*100));
+                if(d2.leads && d2.leads.length > 0) {
+                    updStats(d2.leads);
+                    if(!tableShown) { showPV(d2.leads); tableShown=true; }
+                }
+                setTimeout(poll, 3000);
+            }
+            else if(d2.status==='sending_emails'){
+                if(!tableShown && d2.leads) {
+                    updStats(d2.leads); showPV(d2.leads); tableShown = true;
+                }
+                document.getElementById('dlbtn').classList.remove('hidden');
+                let emailPct = d2.total_to_send > 0 ? (d2.emails_sent / d2.total_to_send) * 100 : 100;
+                setSt(d2.status_text, 'email', Math.max(5, emailPct));
+                setTimeout(poll, 3000);
+            }
+            else if(d2.status==='done'){
+              document.getElementById('btn-run').disabled=false;
+              if(d2.leads) { updStats(d2.leads); showPV(d2.leads); }
+              setSt(d2.status_text, 'done', 100);
+              document.getElementById('dlbtn').classList.remove('hidden');
+            } 
+            else if(d2.status==='error'){
+              document.getElementById('btn-run').disabled=false;
+              setSt(d2.error, 'err');
+            }
+            else {
+              setTimeout(poll, 3000);
+            }
+        } catch(e) {
+            setTimeout(poll, 3000);
+        }
+      };
+      setTimeout(poll, 2000);
+  } catch(e) {
+      setSt('Failed to connect to server.','err');
+      document.getElementById('btn-run').disabled=false;
+  }
+}
+
+function doDL(){ if(jid) window.location='/api/download/'+jid; }
+</script>
+</body>
+</html>"""
 
 @flask_app.route('/')
 def index():
@@ -1048,213 +866,12 @@ def index():
 
 @flask_app.route('/api/scrape', methods=['POST'])
 def start_api_job():
-    """Enhanced endpoint supporting multiple keyword sets"""
-    global latest_job_id
     data = request.json
-    
-    # Check if multi-keyword input
-    if 'keyword_sets' in data and isinstance(data['keyword_sets'], list):
-        # Multi-keyword mode
-        job_group_id = job_manager.create_job_group(data['keyword_sets'])
-        
-        # Start processing immediately
-        threading.Thread(target=process_multi_keyword_job, args=(job_group_id, data)).start()
-        
-        return jsonify({'job_group_id': job_group_id, 'type': 'multi'})
-    else:
-        # Single keyword mode (backward compatible)
-        job_id = str(uuid.uuid4())[:8]
-        latest_job_id = job_id
-        
-        threading.Thread(target=run_enhanced_job_thread, args=(job_id, data)).start()
-        return jsonify({'job_id': job_id, 'type': 'single'})
-
-@flask_app.route('/api/schedule', methods=['POST'])
-def schedule_job():
-    """Schedule a job for BD time"""
-    data = request.json
-    
-    job_group_id = data.get('job_group_id')
-    hour = data.get('hour')
-    minute = data.get('minute')
-    am_pm = data.get('am_pm', 'AM')
-    
-    if not job_group_id or hour is None or minute is None:
-        return jsonify({'error': 'Missing required fields'}), 400
-    
-    scheduled_id = job_manager.schedule_job(job_group_id, hour, minute, am_pm)
-    
-    return jsonify({
-        'scheduled_id': scheduled_id,
-        'message': f'Job scheduled for {hour}:{minute:02d} {am_pm} BD time'
-    })
-
-@flask_app.route('/api/generate_keywords', methods=['POST'])
-def generate_keywords_endpoint():
-    """Generate 100+ keywords for a seed keyword"""
-    data = request.json
-    seed_keyword = data.get('keyword')
-    location = data.get('location')
-    job_group_id = data.get('job_group_id', str(uuid.uuid4())[:8])
-    
-    keywords = enhanced_keyword_engine.generate_complete_keyword_pool(
-        seed_keyword, location, job_group_id
-    )
-    
-    return jsonify({
-        'keywords': keywords[:100],  # Return first 100
-        'total': len(keywords),
-        'job_group_id': job_group_id
-    })
-
-def run_enhanced_job_thread(job_id: str, data: dict):
-    """Enhanced job execution with better keyword generation"""
-    try:
-        location = data.get('location', '').strip()
-        base_keyword = data.get('keyword', '').strip()
-        max_leads = min(int(data.get('max_leads', 10)), 200)
-        max_rating = data.get('max_rating')
-        job_group_id = data.get('job_group_id', job_id)
-        
-        # Initialize enhanced components
-        scraper = EnhancedMapsScraper()
-        
-        jobs[job_id] = {
-            'status': 'scraping',
-            'count': 0,
-            'leads': [],
-            'status_text': f'Generating keywords for: {base_keyword}...',
-            'is_running': True,
-            'stats': {
-                'scraped_total': 0,
-                'emails_found': 0,
-                'keywords_generated': 0,
-                'keywords_used': 0
-            }
-        }
-        
-        # Step 1: Generate 100+ keywords
-        jobs[job_id]['status_text'] = f'Generating 100+ keywords for {base_keyword}...'
-        all_keywords = enhanced_keyword_engine.generate_complete_keyword_pool(
-            base_keyword, location, job_group_id
-        )
-        
-        jobs[job_id]['stats']['keywords_generated'] = len(all_keywords)
-        logger.info(f"[JOB] Generated {len(all_keywords)} keywords for {base_keyword}")
-        
-        # Step 2: Process keywords
-        qualified_leads = []
-        used_keywords = set()
-        
-        for keyword in all_keywords[:100]:  # Process first 100
-            if len(qualified_leads) >= max_leads:
-                break
-            
-            if keyword in used_keywords:
-                continue
-            
-            used_keywords.add(keyword)
-            jobs[job_id]['stats']['keywords_used'] += 1
-            
-            jobs[job_id]['status_text'] = f'Scraping: "{keyword}"... ({len(qualified_leads)}/{max_leads} leads)'
-            
-            # Scrape businesses
-            businesses = scraper.scrape_businesses(keyword, location)
-            jobs[job_id]['stats']['scraped_total'] += len(businesses)
-            
-            # Process each business
-            for business in businesses:
-                if len(qualified_leads) >= max_leads:
-                    break
-                
-                # Extract website
-                website = scraper.website_extractor.extract_website_comprehensive(
-                    business['Name'], location, business.get('Maps_Link')
-                )
-                
-                if website == "N/A":
-                    continue
-                
-                # Extract email (placeholder - use your email extractor)
-                email = "N/A"  # Would integrate with your email extractor
-                
-                if email != "N/A":
-                    business['Website'] = website
-                    business['Email'] = email
-                    qualified_leads.append(business)
-                    jobs[job_id]['stats']['emails_found'] += 1
-                    
-                    logger.info(f"[JOB] Found lead: {business['Name']} - {email}")
-        
-        # Step 3: Send personalized emails
-        if qualified_leads and data.get('templates'):
-            jobs[job_id]['status'] = 'sending_emails'
-            jobs[job_id]['total_to_send'] = len(qualified_leads)
-            emails_sent = 0
-            
-            for lead in qualified_leads:
-                template = random.choice(data['templates'])
-                
-                # Generate personalized email
-                subject, body, personalization = email_personalizer.generate_personalized_email(
-                    lead['Name'], base_keyword, lead.get('Rating', 'N/A'),
-                    location, template['subject'], template['body']
-                )
-                
-                # Send email (placeholder - integrate with your email webhook)
-                # Would call your existing email sending logic
-                
-                emails_sent += 1
-                jobs[job_id]['emails_sent'] = emails_sent
-                
-                time.sleep(random.randint(60, 120))  # Anti-spam delay
-        
-        jobs[job_id]['leads'] = qualified_leads
-        jobs[job_id]['count'] = len(qualified_leads)
-        jobs[job_id]['status'] = 'done'
-        jobs[job_id]['is_running'] = False
-        jobs[job_id]['status_text'] = f'✅ Completed! {len(qualified_leads)} qualified leads found.'
-        
-        logger.info(f"[JOB] Job {job_id} completed with {len(qualified_leads)} leads")
-        
-    except Exception as e:
-        logger.error(f"[JOB] Error: {e}", exc_info=True)
-        jobs[job_id]['status'] = 'error'
-        jobs[job_id]['error'] = str(e)
-        jobs[job_id]['is_running'] = False
-
-def process_multi_keyword_job(job_group_id: str, data: dict):
-    """Process multiple keyword sets sequentially"""
-    keyword_sets = data['keyword_sets']
-    all_leads = []
-    
-    for kw_set in keyword_sets:
-        logger.info(f"[MULTI] Processing: {kw_set['keyword']} in {kw_set['location']}")
-        
-        # Create single job for this keyword set
-        job_data = {
-            'location': kw_set['location'],
-            'keyword': kw_set['keyword'],
-            'max_leads': kw_set.get('target_leads', 10),
-            'max_rating': kw_set.get('max_rating'),
-            'templates': data.get('templates', [])
-        }
-        
-        job_id = str(uuid.uuid4())[:8]
-        run_enhanced_job_thread(job_id, job_data)
-        
-        # Wait for job to complete
-        while jobs.get(job_id, {}).get('is_running', True):
-            time.sleep(2)
-        
-        # Collect leads
-        if job_id in jobs and jobs[job_id].get('leads'):
-            all_leads.extend(jobs[job_id]['leads'])
-        
-        # Update keyword set status
-        db.update_keyword_set_status(kw_set.get('id'), 'completed', len(jobs[job_id].get('leads', [])))
-    
-    logger.info(f"[MULTI] Completed all keyword sets. Total leads: {len(all_leads)}")
+    job_id = str(uuid.uuid4())[:8]
+    t = threading.Thread(target=run_job_thread, args=(job_id, data))
+    t.daemon = True
+    t.start()
+    return jsonify({'job_id': job_id})
 
 @flask_app.route('/api/status/<job_id>')
 def status(job_id):
@@ -1267,552 +884,172 @@ def status(job_id):
 @flask_app.route('/api/download/<job_id>')
 def download(job_id):
     job = jobs.get(job_id)
-    if not job or job.get('status') not in ['done', 'sending_emails']:
-        return "Not ready", 400
-    
+    if not job or job.get('status') not in ['done', 'sending_emails']: return "Not ready", 400
     leads = job.get('leads', [])
-    if not leads:
-        return "No leads found", 404
+    if not leads: return "No leads found", 404
     
     out = io.StringIO()
     writer = csv.DictWriter(out, fieldnames=leads[0].keys())
     writer.writeheader()
     writer.writerows(leads)
     out.seek(0)
+    return send_file(io.BytesIO(out.getvalue().encode('utf-8-sig')), mimetype='text/csv', as_attachment=True, download_name='Target_Leads.csv')
+
+# ══════════════════════════════════════════════
+#   TELEGRAM BOT
+# ══════════════════════════════════════════════
+def to_csv(leads):
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8-sig', newline='')
+    if leads:
+        writer = csv.DictWriter(tmp, fieldnames=leads[0].keys())
+        writer.writeheader()
+        writer.writerows(leads)
+    tmp.close()
+    return tmp.name
+
+M_LOC, M_KW, M_COUNT, M_RATING = range(4)
+bot_store = {}
+
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    kb = [[InlineKeyboardButton("🚀 Start Search", callback_data="start_manual")]]
+    await update.message.reply_text("👋 *LeadGen Pro Bot*\n\n✅ Strict Valid Emails Only\n✅ Auto AI Keyword Expansion\n✅ Max Limit: 200\n\n_Note: For Email Automation, please use the Web Dashboard._", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+
+async def handle_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    bot_store[q.from_user.id] = {}
+    await q.edit_message_text("📍 Enter Location (e.g. New York):")
+    return M_LOC
+
+async def m_loc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    bot_store[update.message.from_user.id]['loc'] = update.message.text
+    await update.message.reply_text("🔍 Enter Keyword (e.g. dentist):")
+    return M_KW
+
+async def m_kw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    bot_store[update.message.from_user.id]['kw'] = update.message.text
+    await update.message.reply_text("🔢 Enter Target Number of Valid Emails (Max 200):")
+    return M_COUNT
+
+async def m_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    count = int(update.message.text) if update.message.text.isdigit() else 10
+    if count > 200: count = 200
+    uid = update.message.from_user.id
+    bot_store[uid]['count'] = count
+    await update.message.reply_text("⭐ Max Rating Filter? (Type 'skip' to ignore, e.g. 3.5):")
+    return M_RATING
+
+async def m_rating(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.lower()
+    uid = update.message.from_user.id
+    bot_store[uid]['rating'] = None if txt == 'skip' else txt
     
-    return send_file(
-        io.BytesIO(out.getvalue().encode('utf-8-sig')),
-        mimetype='text/csv',
-        as_attachment=True,
-        download_name='Enhanced_Leads.csv',
+    data = bot_store[uid]
+    txt_summary = f"📋 *Target Guarantee*\n📍 Loc: {data['loc']}\n🔍 Kw: {data['kw']}\n🔢 Target: {data['count']} Valid Emails\n⭐ Max Rating: {data.get('rating') or 'None'}\n\nStart Scraping?"
+    kb = [[InlineKeyboardButton("✅ Start", callback_data="start_scrape")]]
+    await update.message.reply_text(txt_summary, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    return ConversationHandler.END
+
+def run_bot_scrape_fast(data):
+    location = data['loc']
+    base_keyword = data['kw']
+    max_leads = data['count']
+    max_rating = data.get('rating')
+    
+    maps_scraper = GoogleMapsScraper()
+    email_lib = DeepEmailExtractor()
+    
+    seen_names = set()
+    used_keywords = set()
+    pending_keywords = [base_keyword]
+    final_leads = []
+    
+    while len(final_leads) < max_leads:
+        if not pending_keywords:
+            new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
+            pending_keywords.extend(new_kws)
+            
+        current_kw = pending_keywords.pop(0)
+        used_keywords.add(current_kw.lower())
+        
+        raw_leads = maps_scraper.fetch_batch(current_kw, location)
+        
+        for lead in raw_leads:
+            if len(final_leads) >= max_leads: break
+            if lead['Name'] in seen_names: continue
+            
+            if max_rating and lead['Rating'] != "N/A":
+                try:
+                    if float(lead['Rating']) > float(max_rating): continue
+                except: pass
+                
+            if lead['Website'] == "N/A": continue
+                
+            extracted_email = email_lib.get_email(lead['Website'])
+            if extracted_email == "N/A": continue
+            
+            lead['Email'] = extracted_email
+            seen_names.add(lead['Name'])
+            final_leads.append(lead)
+            
+    return final_leads
+
+async def background_bot_task(chat_id, message_id, data, bot):
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="⏳ *Fast Scraping & Deep Email Extraction running...*\n_AI will auto-expand keywords until target is reached._", parse_mode='Markdown')
+        
+        loop = asyncio.get_event_loop()
+        final_leads = await loop.run_in_executor(None, run_bot_scrape_fast, data)
+        
+        if not final_leads:
+            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="😔 No results found.")
+            return
+
+        path = to_csv(final_leads)
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="✅ Done! Sending file...")
+        with open(path, 'rb') as f:
+            await bot.send_document(
+                chat_id=chat_id, document=f, filename=f"Target_Leads.csv",
+                caption=f"🎯 *Target Reached!*\n📊 Total Valid Emails: {len(final_leads)}", parse_mode='Markdown'
+            )
+        os.unlink(path)
+    except Exception as e:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=f"❌ Error: `{e}`", parse_mode='Markdown')
+
+async def execute_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    data = bot_store.get(uid)
+    
+    msg = await q.edit_message_text("⏳ *Initializing background task...*", parse_mode='Markdown')
+    asyncio.create_task(background_bot_task(q.message.chat_id, msg.message_id, data, ctx.bot))
+
+def run_telegram_bot():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(handle_mode, pattern="^start_manual$")],
+        states={
+            M_LOC: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_loc)],
+            M_KW: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_kw)],
+            M_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_count)],
+            M_RATING: [MessageHandler(filters.TEXT & ~filters.COMMAND, m_rating)]
+        },
+        fallbacks=[],
+        per_message=False,
     )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(execute_scrape, pattern="^start_scrape$"))
+    
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
-# HTML Template (preserved from original, add scheduling UI)
-HTML_TEMPLATE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>LeadGen Pro - Enhanced Edition</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
-<style>
-    * {
-        margin: 0;
-        padding: 0;
-        box-sizing: border-box;
-    }
-    
-    body {
-        font-family: 'Inter', sans-serif;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        min-height: 100vh;
-        padding: 20px;
-    }
-    
-    .container {
-        max-width: 1400px;
-        margin: 0 auto;
-    }
-    
-    .header {
-        text-align: center;
-        color: white;
-        margin-bottom: 30px;
-    }
-    
-    .header h1 {
-        font-size: 2.5rem;
-        margin-bottom: 10px;
-    }
-    
-    .header p {
-        font-size: 1.1rem;
-        opacity: 0.9;
-    }
-    
-    .grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
-        gap: 20px;
-        margin-bottom: 20px;
-    }
-    
-    .card {
-        background: white;
-        border-radius: 12px;
-        padding: 24px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-    }
-    
-    .card h2 {
-        color: #333;
-        margin-bottom: 20px;
-        font-size: 1.5rem;
-        border-bottom: 2px solid #667eea;
-        padding-bottom: 10px;
-    }
-    
-    .form-group {
-        margin-bottom: 15px;
-    }
-    
-    label {
-        display: block;
-        margin-bottom: 5px;
-        color: #555;
-        font-weight: 500;
-    }
-    
-    input, select, textarea {
-        width: 100%;
-        padding: 10px;
-        border: 1px solid #ddd;
-        border-radius: 6px;
-        font-size: 14px;
-    }
-    
-    button {
-        background: #667eea;
-        color: white;
-        border: none;
-        padding: 12px 24px;
-        border-radius: 6px;
-        cursor: pointer;
-        font-size: 14px;
-        font-weight: 600;
-        transition: all 0.3s;
-    }
-    
-    button:hover {
-        background: #5a67d8;
-        transform: translateY(-2px);
-    }
-    
-    .keyword-set {
-        background: #f7f7f7;
-        padding: 15px;
-        border-radius: 8px;
-        margin-bottom: 15px;
-        position: relative;
-    }
-    
-    .keyword-set .remove {
-        position: absolute;
-        top: 10px;
-        right: 10px;
-        background: #e53e3e;
-        padding: 5px 10px;
-        font-size: 12px;
-    }
-    
-    .btn-add {
-        background: #48bb78;
-        margin-top: 10px;
-    }
-    
-    .status-card {
-        background: #f0f4ff;
-        border-left: 4px solid #667eea;
-    }
-    
-    .progress-bar {
-        width: 100%;
-        height: 8px;
-        background: #e2e8f0;
-        border-radius: 4px;
-        overflow: hidden;
-        margin: 10px 0;
-    }
-    
-    .progress-fill {
-        height: 100%;
-        background: #667eea;
-        transition: width 0.3s;
-    }
-    
-    .leads-table {
-        overflow-x: auto;
-        margin-top: 20px;
-    }
-    
-    table {
-        width: 100%;
-        border-collapse: collapse;
-    }
-    
-    th, td {
-        padding: 12px;
-        text-align: left;
-        border-bottom: 1px solid #e2e8f0;
-    }
-    
-    th {
-        background: #f7fafc;
-        font-weight: 600;
-    }
-    
-    .badge {
-        display: inline-block;
-        padding: 4px 8px;
-        border-radius: 4px;
-        font-size: 12px;
-        font-weight: 600;
-    }
-    
-    .badge-success {
-        background: #c6f6d5;
-        color: #22543d;
-    }
-    
-    .badge-warning {
-        background: #feebc8;
-        color: #7b341e;
-    }
-    
-    .keyword-preview {
-        max-height: 200px;
-        overflow-y: auto;
-        background: #f7fafc;
-        padding: 10px;
-        border-radius: 6px;
-        font-size: 12px;
-    }
-</style>
-</head>
-<body>
-<div class="container">
-    <div class="header">
-        <h1><i class="fas fa-bolt"></i> LeadGen Pro - Enhanced Edition</h1>
-        <p>Multi-Keyword | Smart Scheduling | AI Personalization | Negative Review Targeting</p>
-    </div>
-    
-    <div class="grid">
-        <!-- Keyword Sets Input -->
-        <div class="card">
-            <h2><i class="fas fa-key"></i> Keyword Sets</h2>
-            <div id="keywordSetsContainer">
-                <div class="keyword-set" data-index="0">
-                    <button class="remove" onclick="removeKeywordSet(0)">×</button>
-                    <div class="form-group">
-                        <label>Keyword</label>
-                        <input type="text" class="kw-input" placeholder="e.g., dentist, plumber, lawyer">
-                    </div>
-                    <div class="form-group">
-                        <label>Location</label>
-                        <input type="text" class="loc-input" placeholder="e.g., New York">
-                    </div>
-                    <div class="form-group">
-                        <label>Target Leads</label>
-                        <input type="number" class="target-input" value="10" min="1" max="200">
-                    </div>
-                    <div class="form-group">
-                        <label>Max Rating (optional)</label>
-                        <input type="number" class="rating-input" step="0.1" min="1" max="5" placeholder="e.g., 3.5">
-                    </div>
-                </div>
-            </div>
-            <button class="btn-add" onclick="addKeywordSet()"><i class="fas fa-plus"></i> Add Keyword Set</button>
-        </div>
-        
-        <!-- Scheduling -->
-        <div class="card">
-            <h2><i class="fas fa-calendar-alt"></i> Schedule (BD Time)</h2>
-            <div class="form-group">
-                <label>Schedule Time</label>
-                <div style="display: flex; gap: 10px;">
-                    <input type="number" id="scheduleHour" placeholder="Hour" min="1" max="12" style="width: 80px;">
-                    <input type="number" id="scheduleMinute" placeholder="Minute" min="0" max="59" style="width: 80px;">
-                    <select id="scheduleAmPm" style="width: 80px;">
-                        <option value="AM">AM</option>
-                        <option value="PM">PM</option>
-                    </select>
-                </div>
-            </div>
-            <button onclick="scheduleJob()"><i class="fas fa-clock"></i> Schedule Automation</button>
-            <div class="form-group" style="margin-top: 15px;">
-                <label>Or Start Now</label>
-                <button onclick="startMultiKeywordJob()" style="background: #48bb78;"><i class="fas fa-play"></i> Start Now</button>
-            </div>
-        </div>
-        
-        <!-- Status -->
-        <div class="card status-card">
-            <h2><i class="fas fa-chart-line"></i> Status</h2>
-            <div id="statusText">Ready to start</div>
-            <div class="progress-bar">
-                <div class="progress-fill" id="progressFill" style="width: 0%"></div>
-            </div>
-            <div id="stats">
-                <p><strong>Leads Found:</strong> <span id="leadCount">0</span></p>
-                <p><strong>Emails Sent:</strong> <span id="emailCount">0</span></p>
-                <p><strong>Keywords Generated:</strong> <span id="keywordCount">0</span></p>
-            </div>
-        </div>
-    </div>
-    
-    <!-- Generated Keywords Preview -->
-    <div class="card">
-        <h2><i class="fas fa-list"></i> Generated Keywords (100+)</h2>
-        <div id="keywordPreview" class="keyword-preview">
-            <p style="color: #999;">Click "Generate Keywords" to see 100+ keywords</p>
-        </div>
-        <div class="form-group" style="margin-top: 10px;">
-            <label>Seed Keyword</label>
-            <div style="display: flex; gap: 10px;">
-                <input type="text" id="seedKeyword" placeholder="Enter seed keyword">
-                <input type="text" id="seedLocation" placeholder="Location">
-                <button onclick="generateKeywords()" style="background: #ed8936;">Generate 100+ Keywords</button>
-            </div>
-        </div>
-    </div>
-    
-    <!-- Results -->
-    <div class="card">
-        <h2><i class="fas fa-database"></i> Qualified Leads</h2>
-        <div class="leads-table">
-            <table id="leadsTable">
-                <thead>
-                    <tr>
-                        <th>Name</th>
-                        <th>Rating</th>
-                        <th>Phone</th>
-                        <th>Email</th>
-                        <th>Website</th>
-                    </tr>
-                </thead>
-                <tbody id="leadsBody">
-                    <tr><td colspan="5" style="text-align: center;">No leads yet</td></tr>
-                </tbody>
-            </table>
-        </div>
-        <button onclick="downloadLeads()" style="margin-top: 15px;"><i class="fas fa-download"></i> Download CSV</button>
-    </div>
-</div>
-
-<script>
-let currentJobId = null;
-let keywordSets = [];
-
-function addKeywordSet() {
-    const container = document.getElementById('keywordSetsContainer');
-    const index = container.children.length;
-    const newSet = document.createElement('div');
-    newSet.className = 'keyword-set';
-    newSet.setAttribute('data-index', index);
-    newSet.innerHTML = `
-        <button class="remove" onclick="removeKeywordSet(${index})">×</button>
-        <div class="form-group">
-            <label>Keyword</label>
-            <input type="text" class="kw-input" placeholder="e.g., dentist, plumber, lawyer">
-        </div>
-        <div class="form-group">
-            <label>Location</label>
-            <input type="text" class="loc-input" placeholder="e.g., New York">
-        </div>
-        <div class="form-group">
-            <label>Target Leads</label>
-            <input type="number" class="target-input" value="10" min="1" max="200">
-        </div>
-        <div class="form-group">
-            <label>Max Rating (optional)</label>
-            <input type="number" class="rating-input" step="0.1" min="1" max="5" placeholder="e.g., 3.5">
-        </div>
-    `;
-    container.appendChild(newSet);
-}
-
-function removeKeywordSet(index) {
-    const container = document.getElementById('keywordSetsContainer');
-    if (container.children.length > 1) {
-        container.removeChild(container.children[index]);
-        // Re-index remaining sets
-        for (let i = 0; i < container.children.length; i++) {
-            container.children[i].setAttribute('data-index', i);
-            const removeBtn = container.children[i].querySelector('.remove');
-            removeBtn.setAttribute('onclick', `removeKeywordSet(${i})`);
-        }
-    }
-}
-
-function getKeywordSets() {
-    const sets = [];
-    const containers = document.querySelectorAll('.keyword-set');
-    containers.forEach(container => {
-        const keyword = container.querySelector('.kw-input').value.trim();
-        const location = container.querySelector('.loc-input').value.trim();
-        const targetLeads = parseInt(container.querySelector('.target-input').value);
-        const maxRating = container.querySelector('.rating-input').value;
-        
-        if (keyword && location) {
-            sets.push({
-                keyword: keyword,
-                location: location,
-                target_leads: targetLeads,
-                max_rating: maxRating || null
-            });
-        }
-    });
-    return sets;
-}
-
-async function generateKeywords() {
-    const seedKeyword = document.getElementById('seedKeyword').value.trim();
-    const location = document.getElementById('seedLocation').value.trim();
-    
-    if (!seedKeyword || !location) {
-        alert('Please enter seed keyword and location');
-        return;
-    }
-    
-    document.getElementById('keywordPreview').innerHTML = '<p>Generating 100+ keywords...</p>';
-    
-    try {
-        const response = await fetch('/api/generate_keywords', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ keyword: seedKeyword, location: location })
-        });
-        
-        const data = await response.json();
-        
-        const keywordsHtml = data.keywords.map(kw => `<span style="display: inline-block; background: #e2e8f0; padding: 4px 8px; margin: 4px; border-radius: 4px;">${kw}</span>`).join('');
-        document.getElementById('keywordPreview').innerHTML = `<p><strong>${data.total} keywords generated:</strong></p>${keywordsHtml}`;
-        document.getElementById('keywordCount').textContent = data.total;
-        
-    } catch (error) {
-        document.getElementById('keywordPreview').innerHTML = '<p style="color: red;">Error generating keywords</p>';
-    }
-}
-
-async function startMultiKeywordJob() {
-    const sets = getKeywordSets();
-    
-    if (sets.length === 0) {
-        alert('Please add at least one keyword set');
-        return;
-    }
-    
-    const templates = []; // You can add template collection from original UI
-    
-    const response = await fetch('/api/scrape', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            keyword_sets: sets,
-            templates: templates
-        })
-    });
-    
-    const data = await response.json();
-    currentJobId = data.job_group_id;
-    
-    startPolling();
-}
-
-async function scheduleJob() {
-    const sets = getKeywordSets();
-    const hour = parseInt(document.getElementById('scheduleHour').value);
-    const minute = parseInt(document.getElementById('scheduleMinute').value);
-    const amPm = document.getElementById('scheduleAmPm').value;
-    
-    if (sets.length === 0) {
-        alert('Please add at least one keyword set');
-        return;
-    }
-    
-    if (!hour || !minute) {
-        alert('Please enter valid schedule time');
-        return;
-    }
-    
-    // First create job group
-    const createResponse = await fetch('/api/scrape', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keyword_sets: sets, templates: [] })
-    });
-    
-    const createData = await createResponse.json();
-    
-    // Schedule the job
-    const scheduleResponse = await fetch('/api/schedule', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            job_group_id: createData.job_group_id,
-            hour: hour,
-            minute: minute,
-            am_pm: amPm
-        })
-    });
-    
-    const scheduleData = await scheduleResponse.json();
-    alert(`Job scheduled for ${hour}:${minute.toString().padStart(2,'0')} ${amPm} BD time!`);
-}
-
-function startPolling() {
-    const interval = setInterval(async () => {
-        if (!currentJobId) return;
-        
-        try {
-            const response = await fetch(`/api/status/${currentJobId}`);
-            const data = await response.json();
-            
-            document.getElementById('statusText').textContent = data.status_text || data.status;
-            document.getElementById('leadCount').textContent = data.count || 0;
-            document.getElementById('emailCount').textContent = data.emails_sent || 0;
-            
-            const progress = data.total_to_send ? (data.emails_sent / data.total_to_send) * 100 : (data.count / 10) * 100;
-            document.getElementById('progressFill').style.width = `${Math.min(progress, 100)}%`;
-            
-            if (data.leads && data.leads.length > 0) {
-                updateLeadsTable(data.leads);
-            }
-            
-            if (data.status === 'done' || data.status === 'error') {
-                clearInterval(interval);
-            }
-            
-        } catch (error) {
-            console.error('Polling error:', error);
-        }
-    }, 3000);
-}
-
-function updateLeadsTable(leads) {
-    const tbody = document.getElementById('leadsBody');
-    if (!leads || leads.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" style="text-align: center;">No leads yet</td></tr>';
-        return;
-    }
-    
-    tbody.innerHTML = leads.map(lead => `
-        <tr>
-            <td>${lead.Name || 'N/A'}</td>
-            <td><span class="badge ${lead.Rating < 3 ? 'badge-warning' : 'badge-success'}">${lead.Rating || 'N/A'}</span></td>
-            <td>${lead.Phone || 'N/A'}</td>
-            <td>${lead.Email || 'N/A'}</td>
-            <td>${lead.Website || 'N/A'}</td>
-        </tr>
-    `).join('');
-}
-
-async function downloadLeads() {
-    if (!currentJobId) return;
-    window.location.href = `/api/download/${currentJobId}`;
-}
-</script>
-</body>
-</html>
-"""
-
-# ═══════════════════════════════════════════════════════════════════════════
-# MAIN ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    logger.info("🚀 LeadGen Pro Enhanced Starting...")
-    logger.info("Features: Multi-Keyword | Scheduling | 100+ Keywords | Smart Personalization")
-    
+    if TELEGRAM_TOKEN:
+        threading.Thread(target=run_telegram_bot, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    flask_app.run(host='0.0.0.0', port=port)
+
