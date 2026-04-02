@@ -267,7 +267,10 @@ class AdvancedKeywordEngine:
 
 
 # ════════════════════════════════════════════════════
-#   GOOGLE MAPS SCRAPER  (UNCHANGED)
+#   GOOGLE MAPS SCRAPER  — COMPLETELY REWRITTEN
+#   FIX: Uses maps.google.com/maps/search/ URL instead
+#        of tbm=lcl which gets blocked/empty on servers.
+#        Also adds DuckDuckGo as a fallback source.
 # ════════════════════════════════════════════════════
 class GoogleMapsScraper:
     MAX_RETRIES = 3
@@ -275,6 +278,11 @@ class GoogleMapsScraper:
 
     # ── Strategy A: Google Maps search page (primary) ──────────────
     def _scrape_google_maps(self, keyword: str, location: str) -> list:
+        """
+        Scrape Google Maps search results page directly.
+        URL: https://www.google.com/maps/search/{query}/
+        This HTML contains embedded JSON with business data.
+        """
         results = []
         query = urllib.parse.quote_plus(f"{keyword} {location}")
         url = f"https://www.google.com/maps/search/{query}/"
@@ -294,12 +302,16 @@ class GoogleMapsScraper:
 
                 html = resp.text
 
+                # ── Parse embedded JSON chunks that Google Maps puts in the page ──
+                # Pattern: APP_INITIALIZATION_STATE / window.APP_FLAGS / /*""*/ JSON blobs
+                # Business data is also embedded as JS array literals
                 businesses = self._parse_maps_html(html, keyword, location)
 
                 if businesses:
                     logger.info(f"[SCRAPE-MAPS] Parsed {len(businesses)} businesses from Maps HTML")
                     return businesses
 
+                # If no JSON parse, fall back to HTML element parsing
                 businesses = self._parse_maps_html_elements(html, keyword, location)
                 if businesses:
                     logger.info(f"[SCRAPE-MAPS] Parsed {len(businesses)} businesses from Maps HTML elements")
@@ -318,9 +330,14 @@ class GoogleMapsScraper:
         return results
 
     def _parse_maps_html(self, html: str, keyword: str, location: str) -> list:
+        """
+        Extract businesses from Google Maps page embedded data.
+        Google embeds place data as JSON-like structures inside JS strings.
+        """
         results = []
         seen_names = set()
 
+        # ── Method 1: Extract from JSON-LD structured data ──
         try:
             soup = BeautifulSoup(html, 'html.parser')
             for script in soup.find_all('script', type='application/ld+json'):
@@ -353,7 +370,11 @@ class GoogleMapsScraper:
         if results:
             return results
 
+        # ── Method 2: Regex extraction from embedded JS data ──
+        # Google Maps embeds data like: ["Business Name",null,["address",...],["phone",...]]
         try:
+            # Extract all string values that look like business names (capitalized words)
+            # and try to match with nearby rating patterns
             name_pattern = re.findall(
                 r'"([A-Z][^"]{2,60})"[^"]*?"([1-5]\.[0-9])"',
                 html
@@ -380,15 +401,20 @@ class GoogleMapsScraper:
         return results
 
     def _parse_maps_html_elements(self, html: str, keyword: str, location: str) -> list:
+        """
+        Parse Google Maps HTML element structure.
+        Google Maps renders result cards with specific aria/role attributes.
+        """
         results = []
         seen_names = set()
         soup = BeautifulSoup(html, 'html.parser')
 
+        # Google Maps result items — multiple selector strategies
         ITEM_SELECTORS = [
             'div[role="article"]',
             'div[aria-label][role="region"]',
             'a[aria-label][href*="maps"]',
-            'div.Nv2PK',
+            'div.Nv2PK',          # common Maps result card class
             'div.bfdHYd',
             'div[jsaction*="mouseover"]',
         ]
@@ -405,6 +431,7 @@ class GoogleMapsScraper:
             try:
                 text = block.get_text(separator=' ', strip=True)
 
+                # Name from aria-label or heading
                 name = "N/A"
                 aria = block.get('aria-label', '')
                 if aria and len(aria) > 2 and len(aria) < 100:
@@ -418,6 +445,7 @@ class GoogleMapsScraper:
                     continue
                 seen_names.add(name)
 
+                # Rating
                 rating = "N/A"
                 rm = re.search(r'\b([1-5][.,]\d)\b', text)
                 if rm:
@@ -428,16 +456,19 @@ class GoogleMapsScraper:
                     except:
                         pass
 
+                # Review count
                 review_count = "0"
                 rc = re.search(r'\((\d{1,6})\)', text)
                 if rc:
                     review_count = rc.group(1)
 
+                # Phone
                 phone = "N/A"
                 ph = re.search(r'(\+?1?\s*\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4})', text)
                 if ph:
                     phone = ph.group(0).strip()
 
+                # Website
                 website = "N/A"
                 for a in block.select('a[href]'):
                     href = a.get('href', '')
@@ -465,7 +496,11 @@ class GoogleMapsScraper:
 
         return results
 
+    # ── Strategy B: Google Local Search (tbm=lcl) — original approach ──
     def _scrape_google_local(self, keyword: str, location: str) -> list:
+        """
+        Original tbm=lcl scraper, improved with multiple offsets and better selectors.
+        """
         query = urllib.parse.quote_plus(f"{keyword} {location}")
         all_results = []
 
@@ -481,6 +516,7 @@ class GoogleMapsScraper:
 
                     soup = BeautifulSoup(resp.text, 'html.parser')
 
+                    # Extended selector set
                     blocks = soup.select(
                         'div.VkpGBb, div.rllt__details, div.uMdZh, div.cXedhc, '
                         'div.lqhpac, div[data-cid], div.rl_tit, li.rllt__list-item, '
@@ -493,6 +529,7 @@ class GoogleMapsScraper:
                     for block in blocks:
                         text = block.get_text(separator=' ', strip=True)
 
+                        # Name
                         name_el = block.select_one(
                             'div[role="heading"], .dbg0pd, span.OSrXXb, '
                             '.rllt__details div:first-child, [class*="tit"], '
@@ -500,6 +537,7 @@ class GoogleMapsScraper:
                         )
                         name = name_el.get_text(strip=True) if name_el else "N/A"
                         if name == "N/A" or len(name) < 3:
+                            # Fallback: first non-empty text child
                             for el in block.children:
                                 txt = el.get_text(strip=True) if hasattr(el, 'get_text') else ''
                                 if len(txt) > 3 and len(txt) < 80:
@@ -508,6 +546,7 @@ class GoogleMapsScraper:
                         if name == "N/A" or len(name) < 3:
                             continue
 
+                        # Rating
                         rating = "N/A"
                         rm = re.search(r'\b([1-5][.,]\d)\b', text)
                         if rm:
@@ -518,16 +557,19 @@ class GoogleMapsScraper:
                             except:
                                 pass
 
+                        # Review count
                         review_count = "0"
                         rc = re.search(r'\((\d{1,6})\)', text)
                         if rc:
                             review_count = rc.group(1)
 
+                        # Phone
                         phone = "N/A"
                         ph = re.search(r'(\+?1?\s*\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4})', text)
                         if ph:
                             phone = ph.group(0).strip()
 
+                        # Website
                         website = "N/A"
                         for a in block.select('a[href]'):
                             href = a.get('href', '')
@@ -562,6 +604,7 @@ class GoogleMapsScraper:
                     break
             return []
 
+        # Run all offsets concurrently
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
             futures = {ex.submit(fetch_one_offset, s): s for s in [0, 20, 40]}
             for f in concurrent.futures.as_completed(futures):
@@ -572,7 +615,12 @@ class GoogleMapsScraper:
 
         return all_results
 
+    # ── Strategy C: DuckDuckGo local search (fallback) ──
     def _scrape_duckduckgo(self, keyword: str, location: str) -> list:
+        """
+        DuckDuckGo HTML search as a fallback when Google blocks.
+        Extracts business names and websites from organic results.
+        """
         results = []
         seen = set()
         query = urllib.parse.quote_plus(f"{keyword} {location}")
@@ -591,6 +639,7 @@ class GoogleMapsScraper:
 
             for item in result_items[:20]:
                 try:
+                    # Title = likely business name
                     title_el = item.select_one('.result__title, a.result__a, h2')
                     if not title_el:
                         continue
@@ -599,6 +648,7 @@ class GoogleMapsScraper:
                         continue
                     seen.add(name)
 
+                    # URL
                     website = "N/A"
                     link_el = item.select_one('a.result__url, .result__url')
                     if link_el:
@@ -608,6 +658,7 @@ class GoogleMapsScraper:
                         if href.startswith('http'):
                             website = href
 
+                    # Snippet text (for rating extraction if present)
                     snippet = item.get_text(separator=' ', strip=True)
                     rating = "N/A"
                     rm = re.search(r'\b([1-5][.,]\d)\b', snippet)
@@ -638,24 +689,36 @@ class GoogleMapsScraper:
         logger.info(f"[SCRAPE-DDG] Extracted {len(results)} businesses")
         return results
 
+    # ── Master fetch with multi-strategy fallback ──────────────────
     def fetch_batch(self, keyword: str, location: str) -> list:
+        """
+        FIX — CORRECT EXECUTION ORDER:
+        1. Try Google Maps page (primary, best data)
+        2. Try Google Local tbm=lcl (secondary)
+        3. Try DuckDuckGo (final fallback)
+        Merge all results, deduplicate by name, sort bad-rating-first.
+        """
         logger.info(f"[SCRAPE] ═══ Starting scrape for keyword: '{keyword}' in '{location}' ═══")
         all_leads = []
 
+        # ── Strategy A: Google Maps ──
         maps_results = self._scrape_google_maps(keyword, location)
         logger.info(f"[SCRAPE] Strategy A (Google Maps): {len(maps_results)} businesses")
         all_leads.extend(maps_results)
 
+        # ── Strategy B: Google Local (always attempt) ──
         local_results = self._scrape_google_local(keyword, location)
         logger.info(f"[SCRAPE] Strategy B (Google Local): {len(local_results)} businesses")
         all_leads.extend(local_results)
 
+        # ── Strategy C: DuckDuckGo (only if both above yielded < 3) ──
         if len(all_leads) < 3:
             logger.info("[SCRAPE] Insufficient results from Google — trying DuckDuckGo fallback")
             ddg_results = self._scrape_duckduckgo(keyword, location)
             logger.info(f"[SCRAPE] Strategy C (DuckDuckGo): {len(ddg_results)} businesses")
             all_leads.extend(ddg_results)
 
+        # ── Deduplicate by name within this batch ──
         seen_names = set()
         unique_leads = []
         for lead in all_leads:
@@ -664,11 +727,12 @@ class GoogleMapsScraper:
                 seen_names.add(key)
                 unique_leads.append(lead)
 
+        # ── Sort ascending by rating (bad businesses first) ──
         def sort_key(lead):
             try:
                 return float(lead["Rating"])
             except:
-                return 6.0
+                return 6.0   # N/A → processed last
 
         unique_leads.sort(key=sort_key)
 
@@ -678,7 +742,12 @@ class GoogleMapsScraper:
         )
         return unique_leads
 
+    # ── Website fallback via Google search ────────────────────────
     def find_website_via_search(self, business_name: str, location: str) -> str:
+        """
+        Search Google for the official website of a business when
+        the scraper couldn't find it directly.
+        """
         query = urllib.parse.quote_plus(f"{business_name} {location} official website")
         try:
             url = f"https://www.google.com/search?q={query}&num=5&hl=en"
@@ -886,8 +955,20 @@ Return ONLY a valid JSON object with keys:
 
 
 # ════════════════════════════════════════════════════
-#   MASTER JOB RUNNER
+#   MASTER JOB RUNNER  — FIXED EXECUTION FLOW
+#
+#   CORRECT ORDER (mandatory):
+#   STEP 1 → Scrape main keyword FIRST (no keyword generation)
+#   STEP 2 → Process each business (rating filter → website → email)
+#   STEP 3 → Save qualified leads to DB
+#   STEP 4 → Check: reached target? STOP. Else → STEP 5
+#   STEP 5 → Generate NEW keywords (ONLY after initial scrape done)
+#   STEP 6 → Loop: scrape each new keyword → repeat STEP 2-4
 # ════════════════════════════════════════════════════
+
+# NOTE: keyword_engine instantiated lazily inside run_job_thread
+# to avoid triggering AI calls at module import time
+
 def run_job_thread(job_id: str, data: dict):
     try:
         location     = data.get('location', '').strip()
@@ -898,6 +979,7 @@ def run_job_thread(job_id: str, data: dict):
         db_webhook_url = data.get('db_webhook_url', '')
         templates      = data.get('templates', [])
 
+        # ── Normalise rating filter ──
         max_rating_float = None
         if max_rating:
             try:
@@ -906,24 +988,22 @@ def run_job_thread(job_id: str, data: dict):
             except:
                 logger.warning(f"[JOB] Invalid max_rating value '{max_rating}' — filter disabled")
 
+        # ── Instantiate helpers ──
         maps_scraper   = GoogleMapsScraper()
         email_lib      = DeepEmailExtractor()
         kw_engine      = AdvancedKeywordEngine()
         db             = GoogleSheetsDB(db_webhook_url)
         dedup          = DeduplicationStore()
 
-        # ── Added metadata for rehydration and stop feature ──
+        # ── Initialise job state ──
         jobs[job_id] = {
             'status':       'scraping',
             'count':        0,
             'leads':        [],
             'emails_sent':  0,
             'total_to_send': 0,
+            # FIX: status_text now correctly reflects SCRAPING first, not keywords
             'status_text':  f'Starting scrape for: {base_keyword} in {location}...',
-            'stop_requested': False,
-            'location':     location,
-            'keyword':      base_keyword,
-            'target_leads': max_leads,
             'stats': {
                 'scraped_total':      0,
                 'after_rating_filter': 0,
@@ -935,6 +1015,7 @@ def run_job_thread(job_id: str, data: dict):
             },
         }
 
+        # ── DB init ──
         if db_webhook_url:
             db.send_action("init", {})
             db.send_action("update_config", {
@@ -945,26 +1026,33 @@ def run_job_thread(job_id: str, data: dict):
             })
             db.log("Job Start", f"keyword='{base_keyword}' location='{location}' target={max_leads}")
 
+        # ═══════════════════════════════════════════════════
+        # STEP 1: SCRAPE THE MAIN KEYWORD FIRST — NO KEYWORDS YET
+        # ═══════════════════════════════════════════════════
         used_keywords = set()
+
+        # pending_keywords starts with ONLY the user's keyword.
+        # Keyword generation is deferred until AFTER this is exhausted.
         pending_keywords      = [base_keyword]
-        keywords_generated    = False   
+        keywords_generated    = False   # flag: have we generated the expansion pool yet?
 
         def _process_lead_batch(raw_leads: list, current_kw: str) -> bool:
+            """
+            Process one batch of scraped businesses.
+            Returns True if target was reached.
+            """
             jobs[job_id]['stats']['scraped_total'] += len(raw_leads)
             logger.info(f"[JOB] Processing {len(raw_leads)} businesses from keyword '{current_kw}'")
 
             for lead in raw_leads:
-                # Feature 1 Check: Graceful Stop Interruption
-                if jobs[job_id].get('stop_requested'):
-                    logger.info(f"[JOB] 🛑 Stop requested inside batch.")
-                    return True
-
+                # ── Stop if target reached ──
                 if len(jobs[job_id]['leads']) >= max_leads:
                     logger.info(f"[JOB] 🎯 TARGET REACHED: {max_leads} leads — stopping")
                     return True
 
                 logger.info(f"[JOB] Processing business: '{lead['Name']}' | rating={lead['Rating']} | website={lead['Website']}")
 
+                # ── Save every scraped business to DB (raw) ──
                 db.send_action("add_scraped", {
                     "business_name": lead['Name'],
                     "address":       lead['Address'],
@@ -976,45 +1064,73 @@ def run_job_thread(job_id: str, data: dict):
                     "status":        "scraped",
                 })
 
+                # ── RATING FILTER — include only rating <= max_rating ──
                 if max_rating_float is not None and lead['Rating'] != "N/A":
                     try:
                         r_val = float(lead['Rating'])
                         if r_val > max_rating_float:
+                            logger.info(
+                                f"[FILTER] ❌ SKIPPED '{lead['Name']}' "
+                                f"rating={r_val} > max={max_rating_float}"
+                            )
                             continue
+                        else:
+                            logger.info(
+                                f"[FILTER] ✅ ACCEPTED '{lead['Name']}' "
+                                f"rating={r_val} <= max={max_rating_float}"
+                            )
                     except ValueError:
-                        pass
+                        logger.debug(
+                            f"[FILTER] Cannot parse rating '{lead['Rating']}' "
+                            f"for '{lead['Name']}' — allowing through"
+                        )
 
                 jobs[job_id]['stats']['after_rating_filter'] += 1
 
+                # ── WEBSITE RESOLUTION ──────────────────────────────
                 website = lead['Website']
                 if website == "N/A":
                     jobs[job_id]['status_text'] = f"Finding website for: {lead['Name']}..."
+                    logger.info(f"[WEBSITE] Not found in listing for '{lead['Name']}' — searching...")
                     website = maps_scraper.find_website_via_search(lead['Name'], location)
                     lead['Website'] = website
+                    if website != "N/A":
+                        logger.info(f"[WEBSITE] ✅ Found via search: {website}")
+                    else:
+                        logger.info(f"[WEBSITE] ❌ Not found for '{lead['Name']}' — skipping")
 
                 if website == "N/A":
                     continue
 
+                # ── DEDUPLICATION (pre-email) ────────────────────────
                 if dedup.is_duplicate(lead['Name'], website, ""):
                     dedup.mark_skipped()
                     jobs[job_id]['stats']['duplicates_skipped'] = dedup.skipped
+                    logger.info(f"[DEDUP] ⚠ Pre-email duplicate: '{lead['Name']}'")
                     continue
 
+                # ── EMAIL EXTRACTION ────────────────────────────────
                 jobs[job_id]['status_text'] = f"Extracting email from: {lead['Name']}..."
                 extracted_email = email_lib.get_email(website)
 
                 if extracted_email == "N/A":
+                    logger.info(f"[EMAIL] ❌ No email found for '{lead['Name']}' at {website}")
                     continue
 
                 jobs[job_id]['stats']['emails_found'] += 1
+                logger.info(f"[EMAIL] ✅ Found: {extracted_email} for '{lead['Name']}'")
 
+                # ── DEDUPLICATION (post-email) ───────────────────────
                 if dedup.is_duplicate(lead['Name'], website, extracted_email):
                     dedup.mark_skipped()
                     jobs[job_id]['stats']['duplicates_skipped'] = dedup.skipped
+                    logger.info(f"[DEDUP] ⚠ Post-email duplicate: '{lead['Name']}' / {extracted_email}")
                     continue
 
+                # ── REGISTER ────────────────────────────────────────
                 dedup.register(lead['Name'], website, extracted_email)
 
+                # ── SAVE QUALIFIED LEAD TO DB ────────────────────────
                 db.send_action("add_email_lead", {
                     "business_name": lead['Name'], "website": website,
                     "email": extracted_email, "source_page": website, "status": "qualified",
@@ -1031,89 +1147,127 @@ def run_job_thread(job_id: str, data: dict):
                 jobs[job_id]['count'] = len(jobs[job_id]['leads'])
                 jobs[job_id]['stats']['duplicates_skipped'] = dedup.skipped
 
+                logger.info(
+                    f"[LEAD] ✅ #{jobs[job_id]['count']}/{max_leads} "
+                    f"'{lead['Name']}' | rating={lead['Rating']} | {extracted_email}"
+                )
                 jobs[job_id]['status_text'] = (
                     f"✅ {jobs[job_id]['count']}/{max_leads} leads found! "
                     f"Latest: {lead['Name']} ({extracted_email})"
                 )
 
+                # ── TARGET CHECK inside batch ────────────────────────
                 if len(jobs[job_id]['leads']) >= max_leads:
                     logger.info(f"[JOB] 🎯 TARGET REACHED inside batch — stopping")
                     return True
 
-            return False  
+            return False  # target not yet reached
 
-        # PHASE 1: Scraping and processing loop
+        # ════════════════════════════════════════════════════════════
+        # MAIN LOOP — STEP 1 then STEP 5 (keyword gen ONLY after scrape)
+        # ════════════════════════════════════════════════════════════
         while len(jobs[job_id]['leads']) < max_leads:
-            # Feature 1 Check: Graceful Stop Interruption
-            if jobs[job_id].get('stop_requested'):
-                logger.info(f"[JOB] 🛑 Stop requested in main loop.")
-                break
 
+            # ── STEP 5: Generate keywords only when pending list empty
+            #           AND we've already done at least one scrape ──
             if not pending_keywords:
                 if not keywords_generated:
-                    jobs[job_id]['status_text'] = f"Initial scrape done. Generating keyword expansion for '{base_keyword}'..."
+                    # First expansion
+                    jobs[job_id]['status_text'] = (
+                        f"Initial scrape done. Generating keyword expansion for '{base_keyword}'..."
+                    )
+                    logger.info(f"[JOB] STEP 5: Initial keyword expansion for '{base_keyword}'")
                     new_kws = kw_engine.generate_full_pool(base_keyword, location, used_keywords)
                     keywords_generated = True
                 else:
-                    jobs[job_id]['status_text'] = f"Keyword pool exhausted. Re-generating for '{base_keyword}'..."
+                    # Subsequent expansions (edge case: exhausted pool)
+                    jobs[job_id]['status_text'] = (
+                        f"Keyword pool exhausted. Re-generating for '{base_keyword}'..."
+                    )
+                    logger.info(f"[JOB] STEP 5: Re-generating keyword pool")
                     new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
 
                 random.shuffle(new_kws)
                 pending_keywords.extend(new_kws)
                 jobs[job_id]['stats']['keywords_generated'] += len(new_kws)
+                logger.info(f"[JOB] Added {len(new_kws)} new keywords to queue. Total in queue: {len(pending_keywords)}")
 
+                # Save generated keywords to DB
                 for kw in new_kws:
                     db.send_action("add_keyword", {
                         "keyword": kw, "source_seed": base_keyword, "status": "pending"
                     })
 
+            # ── Pop next keyword and scrape it ──
             current_kw = pending_keywords.pop(0)
             used_keywords.add(current_kw.lower())
             jobs[job_id]['stats']['keywords_used'] += 1
 
-            jobs[job_id]['status_text'] = f"[STEP 1] Scraping: '{current_kw}' in '{location}'..."
-            
+            jobs[job_id]['status_text'] = (
+                f"[STEP 1] Scraping: '{current_kw}' in '{location}'..."
+            )
+            logger.info(
+                f"[JOB] ── Scraping keyword {jobs[job_id]['stats']['keywords_used']}: "
+                f"'{current_kw}' | leads so far: {len(jobs[job_id]['leads'])}/{max_leads}"
+            )
+
+            # ── STEP 1: SCRAPE ──
             raw_leads = maps_scraper.fetch_batch(current_kw, location)
 
             if not raw_leads:
+                logger.info(f"[JOB] No businesses found for '{current_kw}' — moving to next keyword")
                 time.sleep(random.uniform(1.0, 2.5))
                 continue
 
+            logger.info(f"[JOB] Businesses found: {len(raw_leads)} for '{current_kw}'")
+
+            # ── STEP 2+3+4: Process, filter, extract, save, check target ──
             target_reached = _process_lead_batch(raw_leads, current_kw)
 
             if target_reached:
+                logger.info(f"[JOB] STOP CONDITION met: {max_leads} qualified leads reached")
                 break
 
+            logger.info(
+                f"[JOB] Qualified leads count: {len(jobs[job_id]['leads'])}/{max_leads} "
+                f"— continuing to next keyword"
+            )
             time.sleep(random.uniform(1.0, 2.0))
 
+        # ── Final stats ──
         s = jobs[job_id]['stats']
         final_count = len(jobs[job_id]['leads'])
-        
-        # Check if scraping ended normally vs stopped
-        is_stopped = jobs[job_id].get('stop_requested')
-
+        logger.info(
+            f"[JOB] ═══ SCRAPING COMPLETE ═══\n"
+            f"  scraped_total     : {s['scraped_total']}\n"
+            f"  after_filter      : {s['after_rating_filter']}\n"
+            f"  emails_found      : {s['emails_found']}\n"
+            f"  duplicates_skipped: {s['duplicates_skipped']}\n"
+            f"  keywords_used     : {s['keywords_used']}\n"
+            f"  keywords_generated: {s['keywords_generated']}\n"
+            f"  final_leads       : {final_count}"
+        )
         db.send_action("update_config", {
             "keyword_seed": base_keyword, "location": location,
             "target_leads": max_leads, "min_rating": "",
-            "max_rating": max_rating or "", "email_required": "true", "status": "stopped" if is_stopped else "stopped",
+            "max_rating": max_rating or "", "email_required": "true", "status": "stopped",
         })
+        db.log("Scraping Done", f"Qualified: {final_count} | Keywords used: {s['keywords_used']}")
 
         final_leads = jobs[job_id]['leads']
 
+        # ════════════════════════════════════════════════════
         # PHASE 2: SEND EMAILS
-        if webhook_url and templates and final_leads and not is_stopped:
+        # ════════════════════════════════════════════════════
+        if webhook_url and templates and final_leads:
             jobs[job_id]['status'] = 'sending_emails'
             jobs[job_id]['total_to_send'] = len(final_leads)
             emails_sent = 0
 
             for lead in final_leads:
-                # Feature 1 Check: Graceful Stop Interruption
-                if jobs[job_id].get('stop_requested'):
-                    logger.info(f"[JOB] 🛑 Stop requested in email loop.")
-                    is_stopped = True
-                    break
-
-                jobs[job_id]['status_text'] = f"Sending email {emails_sent + 1}/{len(final_leads)} → {lead['Email']}"
+                jobs[job_id]['status_text'] = (
+                    f"Sending email {emails_sent + 1}/{len(final_leads)} → {lead['Email']}"
+                )
                 template = random.choice(templates)
                 p_subject, p_body, p_line = personalize_email(
                     lead['Name'], base_keyword,
@@ -1128,28 +1282,25 @@ def run_job_thread(job_id: str, data: dict):
                         "email": lead['Email'], "personalization_line": p_line
                     })
                     db.log("Email Sent", f"→ {lead['Email']}")
+                    logger.info(f"[EMAIL-SEND] ✅ Sent to {lead['Email']}")
                 except Exception as e:
                     jobs[job_id]['stats']['errors'] += 1
+                    logger.error(f"[EMAIL-SEND] ❌ Failed → {lead['Email']}: {e}")
 
                 if emails_sent < len(final_leads):
                     delay = random.randint(60, 120)
                     for i in range(delay, 0, -1):
-                        if jobs[job_id].get('stop_requested'):
-                            is_stopped = True
-                            break
-                        jobs[job_id]['status_text'] = f"Anti-spam cooldown: {i}s before next email..."
+                        jobs[job_id]['status_text'] = (
+                            f"Anti-spam cooldown: {i}s before next email..."
+                        )
                         time.sleep(1)
 
-        if is_stopped:
-            jobs[job_id]['status'] = 'stopped'
-            jobs[job_id]['status_text'] = f"🛑 Automation stopped by user. {final_count} leads found."
-            db.log("Job Stopped", f"Manually stopped. Leads: {final_count}")
-            logger.info(f"[JOB] 🛑 JOB {job_id} STOPPED BY USER — {final_count} leads")
-        else:
-            jobs[job_id]['status'] = 'done'
-            jobs[job_id]['status_text'] = f"✅ Completed! {final_count} qualified leads found."
-            db.log("Job Complete", f"All tasks finished. Leads: {final_count}")
-            logger.info(f"[JOB] ✅ JOB {job_id} COMPLETE — {final_count} leads")
+        jobs[job_id]['status'] = 'done'
+        jobs[job_id]['status_text'] = (
+            f"✅ Completed! {final_count} qualified leads found."
+        )
+        db.log("Job Complete", f"All tasks finished. Leads: {final_count}")
+        logger.info(f"[JOB] ✅ JOB {job_id} COMPLETE — {final_count} leads")
 
     except Exception as e:
         logger.error(f"[JOB] ❌ Fatal error in job {job_id}: {e}", exc_info=True)
@@ -1161,7 +1312,7 @@ def run_job_thread(job_id: str, data: dict):
 
 
 # ════════════════════════════════════════════════════
-#   FLASK APP + UI
+#   FLASK APP + UI  (UI UNCHANGED — PRESERVED)
 # ════════════════════════════════════════════════════
 flask_app = Flask(__name__)
 jobs: dict = {}
@@ -1350,17 +1501,9 @@ tr:hover td{background:var(--bg)}
         <i class="fa-solid fa-triangle-exclamation"></i>
         <span><b>Flow:</b> Scrapes your keyword first → filters by rating → extracts emails → generates more keywords only if target not met. Worst-rated businesses processed first.</span>
       </div>
-      
-      <!-- STOP & START BUTTONS -->
-      <div class="flex gap-2" style="margin-top:12px">
-        <button onclick="startJob()" id="btn-run" class="btn btn-primary flex-1">
-          <i class="fa-solid fa-play"></i>Start Scraping
-        </button>
-        <button onclick="stopJob()" id="btn-stop" class="btn btn-neutral flex-1 hidden" style="color:var(--red); border-color:var(--red)">
-          <i class="fa-solid fa-stop"></i>Stop Automation
-        </button>
-      </div>
-
+      <button onclick="startJob()" id="btn-run" class="btn btn-primary btn-full" style="margin-top:12px">
+        <i class="fa-solid fa-play"></i>Start Scraping
+      </button>
     </div>
 
     <div id="sbox" class="hidden card fade-in">
@@ -1508,54 +1651,7 @@ window.onload = () => {
   templates   = JSON.parse(localStorage.getItem('templates')  || '[]');
   historyData = JSON.parse(localStorage.getItem('history')    || '[]');
   renderTemplates(); renderHistory();
-
-  // FEATURE 2: STATE REHYDRATION
-  const savedJid = localStorage.getItem('active_jid');
-  if(savedJid) resumeJob(savedJid);
 };
-
-// State rehydration loader
-async function resumeJob(savedJid) {
-  jid = savedJid;
-  try {
-    const r = await fetch('/api/status/'+jid);
-    const d = await r.json();
-    if(d.status === 'not_found') {
-      localStorage.removeItem('active_jid');
-      return;
-    }
-
-    // Restore UI Configuration
-    document.getElementById('sbox').classList.remove('hidden');
-    document.getElementById('btn-run').classList.add('hidden');
-    document.getElementById('btn-stop').classList.remove('hidden');
-
-    if(d.location) document.getElementById('m-loc').value = d.location;
-    if(d.keyword) document.getElementById('m-kw').value = d.keyword;
-    if(d.target_leads) document.getElementById('m-count').value = d.target_leads;
-
-    if(d.leads && d.leads.length > 0) {
-      updStats(d.leads);
-      showPV(d.leads);
-      tableShown = true;
-    } else {
-      tableShown = false;
-    }
-
-    if(d.status === 'done' || d.status === 'error' || d.status === 'stopped') {
-      document.getElementById('btn-run').classList.remove('hidden');
-      document.getElementById('btn-stop').classList.add('hidden');
-      localStorage.removeItem('active_jid');
-      setSt(d.status_text || 'Completed', d.status === 'error' || d.status === 'stopped' ? 'err' : 'done', 100);
-      if(d.status === 'done' || d.status === 'stopped') document.getElementById('dlbtn').classList.remove('hidden');
-      if(d.stats) renderDebugStats(d.stats);
-    } else {
-      startPolling(d.target_leads || 200);
-    }
-  } catch(e) {
-    console.error("Resume error", e);
-  }
-}
 
 const TABS = ['search','database','connect','templates','history'];
 function showTab(t) {
@@ -1613,7 +1709,7 @@ function setSt(msg, state='load', pct=null) {
     load:  ['fa-circle-notch spin','var(--accent)',   'Scraping Engine Running…'],
     email: ['fa-paper-plane blink', 'var(--green)',   'Sending Emails…'],
     done:  ['fa-circle-check',      'var(--green)',   'Completed!'],
-    err:   ['fa-circle-xmark',      'var(--red)',     'Stopped / Error'],
+    err:   ['fa-circle-xmark',      'var(--red)',     'Error Occurred'],
   };
   const [iconCls,col,label] = iconMap[state] || iconMap.load;
   ic.className = `fa-solid ${iconCls} status-icon`;
@@ -1660,16 +1756,6 @@ function showPV(leads) {
   ).join('');
 }
 
-// FEATURE 1: Stop Automation Logic
-async function stopJob() {
-  if(!jid) return;
-  document.getElementById('btn-stop').innerHTML = '<i class="fa-solid fa-spinner spin"></i> Stopping...';
-  document.getElementById('btn-stop').disabled = true;
-  try {
-    await fetch('/api/stop/' + jid, { method: 'POST' });
-  } catch(e) {}
-}
-
 async function startJob() {
   const loc   = document.getElementById('m-loc').value.trim();
   const kw    = document.getElementById('m-kw').value.trim();
@@ -1682,12 +1768,7 @@ async function startJob() {
   document.getElementById('dlbtn').classList.add('hidden');
   document.getElementById('pvbox').classList.add('hidden');
   document.getElementById('debug-stats').innerHTML = '';
-  
-  // Swap Buttons
-  document.getElementById('btn-run').classList.add('hidden');
-  document.getElementById('btn-stop').classList.remove('hidden');
-  document.getElementById('btn-stop').innerHTML = '<i class="fa-solid fa-stop"></i>Stop Automation';
-  document.getElementById('btn-stop').disabled = false;
+  document.getElementById('btn-run').disabled = true;
   tableShown = false;
 
   const payload = {
@@ -1701,19 +1782,14 @@ async function startJob() {
   try {
     const r = await fetch('/api/scrape',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     const d = await r.json();
-    if(d.error){ setSt(d.error,'err'); document.getElementById('btn-run').classList.remove('hidden'); document.getElementById('btn-stop').classList.add('hidden'); return; }
+    if(d.error){ setSt(d.error,'err'); document.getElementById('btn-run').disabled=false; return; }
     jid = d.job_id;
-    
-    // Save to LocalStorage for persistence across refreshes
-    localStorage.setItem('active_jid', jid);
-    
     historyData.unshift({loc,kw,target:count,date:new Date().toLocaleString()});
     localStorage.setItem('history',JSON.stringify(historyData)); renderHistory();
     startPolling(count);
   } catch(e) {
     setSt('Could not connect to server.','err');
-    document.getElementById('btn-run').classList.remove('hidden');
-    document.getElementById('btn-stop').classList.add('hidden');
+    document.getElementById('btn-run').disabled=false;
   }
 }
 
@@ -1734,23 +1810,14 @@ function startPolling(target) {
         const pct = d2.total_to_send>0 ? (d2.emails_sent/d2.total_to_send)*100 : 50;
         setSt(d2.status_text||'Sending…','email',pct);
         setTimeout(poll, 2500);
-      } else if(d2.status==='done' || d2.status==='stopped' || d2.status==='error') {
-        // Restore Buttons
-        document.getElementById('btn-run').classList.remove('hidden');
-        document.getElementById('btn-stop').classList.add('hidden');
-        document.getElementById('btn-stop').innerHTML = '<i class="fa-solid fa-stop"></i>Stop Automation';
-        document.getElementById('btn-stop').disabled = false;
-        
-        // Remove persistence token
-        localStorage.removeItem('active_jid');
-
+      } else if(d2.status==='done') {
+        document.getElementById('btn-run').disabled=false;
         if(d2.leads){ updStats(d2.leads); showPV(d2.leads); }
-        if(d2.status === 'error') {
-          setSt(d2.error||'Unknown error','err');
-        } else {
-          setSt(d2.status_text||(d2.status==='done'?'Done!':'Stopped!'), d2.status==='done'?'done':'err', 100);
-          document.getElementById('dlbtn').classList.remove('hidden');
-        }
+        setSt(d2.status_text||'Done!','done',100);
+        document.getElementById('dlbtn').classList.remove('hidden');
+      } else if(d2.status==='error') {
+        document.getElementById('btn-run').disabled=false;
+        setSt(d2.error||'Unknown error','err');
       } else {
         setTimeout(poll, 2500);
       }
@@ -1786,19 +1853,12 @@ def start_api_job():
     t.start()
     return jsonify({'job_id': job_id})
 
-# FEATURE 1: ADDED API ENDPOINT TO STOP RUNNING AUTOMATION
-@flask_app.route('/api/stop/<job_id>', methods=['POST'])
-def stop_api_job(job_id):
-    if job_id in jobs:
-        jobs[job_id]['stop_requested'] = True
-        return jsonify({'status': 'stopping'})
-    return jsonify({'error': 'not_found'}), 404
 
 @flask_app.route('/api/status/<job_id>')
 def status(job_id):
     job = jobs.get(job_id, {'status': 'not_found'})
     out = dict(job)
-    if out.get('status') in ['sending_emails', 'done', 'scraping', 'stopped']:
+    if out.get('status') in ['sending_emails', 'done', 'scraping']:
         out['leads'] = job.get('leads', [])
     return jsonify(out)
 
@@ -1806,7 +1866,7 @@ def status(job_id):
 @flask_app.route('/api/download/<job_id>')
 def download(job_id):
     job = jobs.get(job_id)
-    if not job or job.get('status') not in ['done', 'sending_emails', 'stopped']:
+    if not job or job.get('status') not in ['done', 'sending_emails']:
         return "Not ready", 400
     leads = job.get('leads', [])
     if not leads:
@@ -1909,6 +1969,7 @@ def run_bot_scrape_fast(data: dict) -> list:
     dedup      = DeduplicationStore()
 
     used_keywords    = set()
+    # CORRECT ORDER: main keyword scrapes first
     pending_keywords = [base_keyword]
     keywords_generated = False
     final_leads = []
