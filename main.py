@@ -109,14 +109,14 @@ class GoogleSheetsDB:
 
 
 # ════════════════════════════════════════════════════
-#   DEDUPLICATION STORE  (UNCHANGED)
+#   DEDUPLICATION STORE  (UPDATED FOR PROBLEM 5)
 # ════════════════════════════════════════════════════
 class DeduplicationStore:
     def __init__(self):
         self._lock = threading.Lock()
-        self._names:    set = set()
         self._websites: set = set()
         self._emails:   set = set()
+        self._name_locs: set = set() # [PROBLEM 5] Strict Name + Location checking
         self._total_skipped = 0
 
     def _norm(self, val: str) -> str:
@@ -134,22 +134,30 @@ class DeduplicationStore:
         except:
             return url.lower().strip()
 
-    def is_duplicate(self, name: str, website: str, email: str) -> bool:
+    # [PROBLEM 5] Added location to ensure strict deduplication across the board
+    def is_duplicate(self, name: str, location: str, website: str, email: str) -> bool:
         nn = self._norm(name)
+        nl = self._norm(location)
+        nloc = f"{nn} {nl}"
         nw = self._norm_url(website)
         ne = self._norm(email)
+        
         with self._lock:
-            if nn and nn in self._names:    return True
-            if nw and nw in self._websites: return True
+            # Check if exists based on Email OR Website OR Name+Location
             if ne and ne in self._emails:   return True
+            if nw and nw in self._websites: return True
+            if nn and nl and nloc in self._name_locs: return True
         return False
 
-    def register(self, name: str, website: str, email: str):
+    def register(self, name: str, location: str, website: str, email: str):
         nn = self._norm(name)
+        nl = self._norm(location)
+        nloc = f"{nn} {nl}"
         nw = self._norm_url(website)
         ne = self._norm(email)
+        
         with self._lock:
-            if nn: self._names.add(nn)
+            if nn and nl: self._name_locs.add(nloc)
             if nw: self._websites.add(nw)
             if ne: self._emails.add(ne)
 
@@ -164,7 +172,7 @@ class DeduplicationStore:
 
 
 # ════════════════════════════════════════════════════
-#   ADVANCED KEYWORD ENGINE  (UNCHANGED — PRESERVED)
+#   ADVANCED KEYWORD ENGINE  (PRESERVED ALL + ADDED 1-by-1)
 # ════════════════════════════════════════════════════
 class AdvancedKeywordEngine:
     COMMERCIAL_PREFIXES = [
@@ -277,13 +285,79 @@ class AdvancedKeywordEngine:
         logger.info(f"[KEYWORDS] Full pool → {len(final)} unique keywords for '{base_kw}'")
         return final
 
+    # [PROBLEM 2] ADDED STRICT ONE-BY-ONE KEYWORD GENERATOR
+    def generate_single_keyword(self, base_kw, location, used_kws) -> str:
+        if GROQ_API_KEY:
+            try:
+                client = Groq(api_key=GROQ_API_KEY)
+                prompt = (
+                    f"You are a local SEO expert. Base keyword: '{base_kw}'. Location: '{location}'. "
+                    f"Used keywords: {list(used_kws)[:50]}. "
+                    f"Generate EXACTLY ONE new, highly relevant search term a user would type to find these local businesses. "
+                    f"Return ONLY the exact search term string. No quotes, no intro, no numbering."
+                )
+                res = client.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="llama3-8b-8192",
+                    temperature=0.8,
+                    max_tokens=30,
+                )
+                text = res.choices[0].message.content.strip().strip('"').strip("'")
+                kw = text.split('\n')[0].split(',')[0].strip() # Clean output
+                if kw and kw.lower() not in used_kws and len(kw) > 3:
+                    logger.info(f"[KEYWORDS] AI generated single keyword: '{kw}'")
+                    return kw
+            except Exception as e:
+                logger.warning(f"[KEYWORDS] AI single gen failed: {e}")
+
+        # Fallback loop
+        for p in self.COMMERCIAL_PREFIXES:
+            kw = f"{p} {base_kw}"
+            if kw.lower() not in used_kws: return kw
+        for s in self.COMMERCIAL_SUFFIXES:
+            kw = f"{base_kw} {s}"
+            if kw.lower() not in used_kws: return kw
+            
+        return None
+
 
 # ════════════════════════════════════════════════════
-#   GOOGLE MAPS SCRAPER  — COMPLETELY REWRITTEN
+#   GOOGLE MAPS SCRAPER  — UPDATED FOR PROBLEM 1
 # ════════════════════════════════════════════════════
 class GoogleMapsScraper:
     MAX_RETRIES = 3
     RETRY_DELAY = 2
+
+    # [PROBLEM 1] Website Validation Logic
+    def is_valid_website(self, url: str) -> bool:
+        if not url or url == "N/A": return False
+        lower_url = url.lower()
+        blacklist = [
+            'google.com', 'google.co', 'yelp.com', 'tripadvisor.com', 'facebook.com',
+            'instagram.com', 'twitter.com', 'linkedin.com', 'youtube.com', 'bbb.org',
+            'yellowpages.com', 'mapquest.com', 'foursquare.com', 'yahoo.com', 'bing.com',
+            'zoominfo.com', 'chamberofcommerce.com', 'houzz.com', 'angi.com', 'thumbtack.com',
+            '/url?q='
+        ]
+        for b in blacklist:
+            if b in lower_url: return False
+        if not lower_url.startswith('http'): return False
+        return True
+
+    # [PROBLEM 1] Step 2: Fetch external website explicitly from Google Maps details block
+    def fetch_website_from_details(self, maps_url: str) -> str:
+        if not maps_url or maps_url == "N/A": return "N/A"
+        try:
+            resp = requests.get(maps_url, headers=get_headers(), timeout=10, verify=False)
+            urls = re.findall(r'"(https?://[^"]+)"', resp.text)
+            for u in urls:
+                u_clean = u.replace('\\u0026', '&')
+                if self.is_valid_website(u_clean):
+                    logger.info(f"[WEBSITE-DETAILS] Found real site via maps page: {u_clean}")
+                    return u_clean
+        except Exception as e:
+            logger.debug(f"[WEBSITE-DETAILS] Error fetching {maps_url}: {e}")
+        return "N/A"
 
     def _scrape_google_maps(self, keyword: str, location: str) -> list:
         results = []
@@ -353,7 +427,7 @@ class GoogleMapsScraper:
                                 "ReviewCount": str(item.get('aggregateRating', {}).get('reviewCount', '0')),
                                 "Address":     location,
                                 "Category":    keyword,
-                                "Maps_Link":   item.get('hasMap', 'N/A') or 'N/A',
+                                "Maps_Link":   item.get('hasMap', 'N/A') or f"https://www.google.com/maps/search/{urllib.parse.quote_plus(name + ' ' + location)}/",
                             })
                 except:
                     pass
@@ -688,25 +762,39 @@ class GoogleMapsScraper:
         )
         return unique_leads
 
+    # [PROBLEM 1] Step 3: Better find_website_via_search with validation
     def find_website_via_search(self, business_name: str, location: str) -> str:
         query = urllib.parse.quote_plus(f"{business_name} {location} official website")
+        
+        # 1. Google Search
         try:
             url = f"https://www.google.com/search?q={query}&num=5&hl=en"
             resp = requests.get(url, headers=get_headers(), timeout=8, verify=False)
             soup = BeautifulSoup(resp.text, 'html.parser')
-            blacklist = ('google', 'facebook', 'yelp', 'tripadvisor',
-                         'instagram', 'twitter', 'linkedin', 'youtube',
-                         'bbb.org', 'yellowpages')
             for a in soup.select('a[href]'):
                 href = a.get('href', '')
                 if '/url?q=' in href:
                     clean = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
-                    if (clean.startswith('http') and
-                            not any(b in clean.lower() for b in blacklist)):
-                        logger.info(f"[WEBSITE-SEARCH] Found for '{business_name}': {clean}")
+                    if self.is_valid_website(clean):
+                        logger.info(f"[WEBSITE-SEARCH] Found via Google for '{business_name}': {clean}")
                         return clean
         except Exception as e:
-            logger.debug(f"[WEBSITE-SEARCH] Failed for '{business_name}': {e}")
+            logger.debug(f"[WEBSITE-SEARCH] Google search failed: {e}")
+
+        # 2. DuckDuckGo Fallback
+        try:
+            url_ddg = f"https://html.duckduckgo.com/html/?q={query}"
+            resp_ddg = requests.get(url_ddg, headers=get_headers(), timeout=8, verify=False)
+            soup_ddg = BeautifulSoup(resp_ddg.text, 'html.parser')
+            for a in soup_ddg.select('a.result__url, .result__url'):
+                href = a.get('href', '') or a.get_text(strip=True)
+                if href and not href.startswith('http'): href = 'https://' + href
+                if self.is_valid_website(href):
+                    logger.info(f"[WEBSITE-SEARCH] Found via DDG for '{business_name}': {href}")
+                    return href
+        except Exception as e:
+            logger.debug(f"[WEBSITE-SEARCH] DDG failed: {e}")
+
         return "N/A"
 
 
@@ -958,7 +1046,6 @@ def run_job_thread(job_id: str, data: dict):
 
         used_keywords = set()
         pending_keywords      = [base_keyword]
-        keywords_generated    = False
 
         def _process_lead_batch(raw_leads: list, current_kw: str) -> bool:
             """
@@ -981,6 +1068,9 @@ def run_job_thread(job_id: str, data: dict):
 
                 logger.info(f"[JOB] Processing business: '{lead['Name']}' | rating={lead['Rating']} | website={lead['Website']}")
 
+                # [PROBLEM 6] Store Maps URL and all data
+                maps_url = lead.get('Maps_Link', 'N/A')
+
                 db.send_action("add_scraped", {
                     "business_name": lead['Name'],
                     "address":       lead['Address'],
@@ -988,6 +1078,7 @@ def run_job_thread(job_id: str, data: dict):
                     "rating":        lead['Rating'],
                     "review_count":  lead.get('ReviewCount', 'N/A'),
                     "website":       lead['Website'],
+                    "maps_url":      maps_url,
                     "keyword":       current_kw,
                     "status":        "scraped",
                 })
@@ -1014,21 +1105,30 @@ def run_job_thread(job_id: str, data: dict):
 
                 jobs[job_id]['stats']['after_rating_filter'] += 1
 
+                # [PROBLEM 1] FULL WEBSITE EXTRACTION PIPELINE
                 website = lead['Website']
-                if website == "N/A":
-                    jobs[job_id]['status_text'] = f"Finding website for: {lead['Name']}..."
-                    logger.info(f"[WEBSITE] Not found in listing for '{lead['Name']}' — searching...")
-                    website = maps_scraper.find_website_via_search(lead['Name'], location)
-                    lead['Website'] = website
-                    if website != "N/A":
-                        logger.info(f"[WEBSITE] ✅ Found via search: {website}")
-                    else:
-                        logger.info(f"[WEBSITE] ❌ Not found for '{lead['Name']}' — skipping")
+                if not maps_scraper.is_valid_website(website):
+                    website = "N/A"
+
+                if website == "N/A" and maps_url != "N/A":
+                    jobs[job_id]['status_text'] = f"Checking details page for: {lead['Name']}..."
+                    logger.info(f"[WEBSITE] Not found in listing — checking Maps detail page...")
+                    website = maps_scraper.fetch_website_from_details(maps_url)
 
                 if website == "N/A":
+                    jobs[job_id]['status_text'] = f"Finding website via search: {lead['Name']}..."
+                    logger.info(f"[WEBSITE] Not found in details — searching Google/DDG...")
+                    website = maps_scraper.find_website_via_search(lead['Name'], location)
+                    
+                lead['Website'] = website
+                if website != "N/A":
+                    logger.info(f"[WEBSITE] ✅ Valid website found: {website}")
+                else:
+                    logger.info(f"[WEBSITE] ❌ Not found for '{lead['Name']}' — skipping")
                     continue
 
-                if dedup.is_duplicate(lead['Name'], website, ""):
+                # [PROBLEM 5] STRICT DEDUPLICATION BEFORE EMAIL
+                if dedup.is_duplicate(lead['Name'], location, website, ""):
                     dedup.mark_skipped()
                     jobs[job_id]['stats']['duplicates_skipped'] = dedup.skipped
                     logger.info(f"[DEDUP] ⚠ Pre-email duplicate: '{lead['Name']}'")
@@ -1049,21 +1149,24 @@ def run_job_thread(job_id: str, data: dict):
                 jobs[job_id]['stats']['emails_found'] += 1
                 logger.info(f"[EMAIL] ✅ Found: {extracted_email} for '{lead['Name']}'")
 
-                if dedup.is_duplicate(lead['Name'], website, extracted_email):
+                # [PROBLEM 5] STRICT DEDUPLICATION AFTER EMAIL
+                if dedup.is_duplicate(lead['Name'], location, website, extracted_email):
                     dedup.mark_skipped()
                     jobs[job_id]['stats']['duplicates_skipped'] = dedup.skipped
                     logger.info(f"[DEDUP] ⚠ Post-email duplicate: '{lead['Name']}' / {extracted_email}")
                     continue
 
-                dedup.register(lead['Name'], website, extracted_email)
+                dedup.register(lead['Name'], location, website, extracted_email)
 
+                # [PROBLEM 6] FULL DATA SAVE TO DB
                 db.send_action("add_email_lead", {
                     "business_name": lead['Name'], "website": website,
                     "email": extracted_email, "source_page": website, "status": "qualified",
                 })
                 db.send_action("add_qualified", {
-                    "business_name": lead['Name'], "email": extracted_email,
-                    "website": website, "rating": lead['Rating'],
+                    "business_name": lead['Name'], "address": lead['Address'], "phone": lead['Phone'],
+                    "rating": lead['Rating'], "review_count": lead.get('ReviewCount', 'N/A'),
+                    "website": website, "email": extracted_email, "maps_url": maps_url,
                     "keyword": current_kw, "personalization_line": "Pending AI...",
                     "email_sent": "no",
                 })
@@ -1103,29 +1206,21 @@ def run_job_thread(job_id: str, data: dict):
                 if _should_stop(job_id):
                     break
 
-                if not keywords_generated:
-                    jobs[job_id]['status_text'] = (
-                        f"Initial scrape done. Generating keyword expansion for '{base_keyword}'..."
-                    )
-                    logger.info(f"[JOB] STEP 5: Initial keyword expansion for '{base_keyword}'")
-                    new_kws = kw_engine.generate_full_pool(base_keyword, location, used_keywords)
-                    keywords_generated = True
-                else:
-                    jobs[job_id]['status_text'] = (
-                        f"Keyword pool exhausted. Re-generating for '{base_keyword}'..."
-                    )
-                    logger.info(f"[JOB] STEP 5: Re-generating keyword pool")
-                    new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
-
-                random.shuffle(new_kws)
-                pending_keywords.extend(new_kws)
-                jobs[job_id]['stats']['keywords_generated'] += len(new_kws)
-                logger.info(f"[JOB] Added {len(new_kws)} new keywords to queue. Total in queue: {len(pending_keywords)}")
-
-                for kw in new_kws:
+                # [PROBLEM 2] STRICT ONE-BY-ONE KEYWORD GENERATION
+                jobs[job_id]['status_text'] = f"Generating 1 new exact keyword for '{base_keyword}'..."
+                logger.info(f"[JOB] Target not reached. Generating ONE new keyword...")
+                new_kw = kw_engine.generate_single_keyword(base_keyword, location, used_keywords)
+                
+                if new_kw:
+                    pending_keywords.append(new_kw)
+                    jobs[job_id]['stats']['keywords_generated'] += 1
+                    logger.info(f"[JOB] Added new keyword: '{new_kw}'")
                     db.send_action("add_keyword", {
-                        "keyword": kw, "source_seed": base_keyword, "status": "pending"
+                        "keyword": new_kw, "source_seed": base_keyword, "status": "pending"
                     })
+                else:
+                    logger.info("[JOB] Keyword pool exhausted. Cannot generate more.")
+                    break
 
             current_kw = pending_keywords.pop(0)
             used_keywords.add(current_kw.lower())
@@ -1328,6 +1423,7 @@ h1,h2,h3,.syne{font-family:'Syne',sans-serif}
 label{font-size:12px;font-weight:600;color:var(--ink2);letter-spacing:.01em;text-transform:uppercase}
 .inp{background:var(--bg);border:1.5px solid var(--border);color:var(--ink);border-radius:8px;padding:10px 13px;font-size:14px;width:100%;font-family:'Outfit',sans-serif;transition:border .15s,box-shadow .15s;outline:none}
 .inp:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(212,82,42,.1)}
+.inp:disabled{opacity:0.6;cursor:not-allowed;background:var(--surface2)}
 .inp::placeholder{color:var(--ink3)}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:none;border-radius:8px;font-weight:600;font-size:14px;cursor:pointer;transition:all .15s;font-family:'Outfit',sans-serif;padding:11px 20px;white-space:nowrap}
 .btn:disabled{opacity:.4;cursor:not-allowed;pointer-events:none}
@@ -1472,7 +1568,7 @@ tr:hover td{background:var(--bg)}
       </div>
       <div class="notice notice-warn mt-2">
         <i class="fa-solid fa-triangle-exclamation"></i>
-        <span><b>Flow:</b> Scrapes your keyword first → filters by rating → extracts emails → generates more keywords only if target not met. Worst-rated businesses processed first.</span>
+        <span><b>Flow:</b> Scrapes your keyword first → filters by rating → extracts websites → extracts emails → generates ONE keyword at a time if target not met.</span>
       </div>
       <!-- [STOP FEATURE] Start and Stop buttons side by side -->
       <div class="btn-row">
@@ -1518,6 +1614,7 @@ tr:hover td{background:var(--bg)}
         <span>Go to <a href="https://script.google.com" target="_blank" style="color:var(--blue)">script.google.com</a> → New Project → paste script → Deploy as Web App (Anyone) → copy URL.</span>
       </div>
       <div style="position:relative;margin-bottom:14px">
+        <button onclick="unlockSettings()" class="btn btn-ghost btn-unlock" style="position:absolute;top:8px;right:60px;font-size:11px;padding:5px 10px;z-index:1"><i class="fa-solid fa-lock"></i> Unlock</button>
         <button onclick="copyDBScript()" class="btn btn-neutral" style="position:absolute;top:8px;right:8px;font-size:11px;padding:5px 10px;z-index:1">Copy</button>
         <textarea id="db-script-code" readonly class="inp" style="font-family:monospace;font-size:11px;height:160px;resize:none;padding-top:10px;color:var(--blue)">
 function doPost(e) {
@@ -1533,17 +1630,17 @@ function doPost(e) {
     if (action === "init") {
       getOrCreateSheet("Config",["keyword_seed","location","target_leads","min_rating","max_rating","email_required","status"]);
       getOrCreateSheet("Generated_Keywords",["keyword","source_seed","status"]);
-      getOrCreateSheet("Scraped_Businesses",["business_name","address","phone","rating","review_count","website","keyword","status"]);
+      getOrCreateSheet("Scraped_Businesses",["business_name","address","phone","rating","review_count","website","maps_url","keyword","status"]);
       getOrCreateSheet("Email_Leads",["business_name","website","email","source_page","status"]);
-      getOrCreateSheet("Qualified_Leads",["business_name","email","website","rating","keyword","personalization_line","email_sent"]);
+      getOrCreateSheet("Qualified_Leads",["business_name","address","phone","rating","review_count","website","email","maps_url","keyword","personalization_line","email_sent"]);
       getOrCreateSheet("Logs",["timestamp","action","details"]);
     } else if (action === "log") { var s=ss.getSheetByName("Logs"); if(s) s.appendRow([data.timestamp,data.action,data.details]); }
     else if (action === "add_keyword") { var s=ss.getSheetByName("Generated_Keywords"); if(s) s.appendRow([data.keyword,data.source_seed,data.status]); }
-    else if (action === "add_scraped") { var s=ss.getSheetByName("Scraped_Businesses"); if(s) s.appendRow([data.business_name,data.address,data.phone,data.rating,data.review_count,data.website,data.keyword,data.status]); }
+    else if (action === "add_scraped") { var s=ss.getSheetByName("Scraped_Businesses"); if(s) s.appendRow([data.business_name,data.address,data.phone,data.rating,data.review_count,data.website,data.maps_url,data.keyword,data.status]); }
     else if (action === "add_email_lead") { var s=ss.getSheetByName("Email_Leads"); if(s) s.appendRow([data.business_name,data.website,data.email,data.source_page,data.status]); }
-    else if (action === "add_qualified") { var s=ss.getSheetByName("Qualified_Leads"); if(s) s.appendRow([data.business_name,data.email,data.website,data.rating,data.keyword,data.personalization_line,data.email_sent]); }
+    else if (action === "add_qualified") { var s=ss.getSheetByName("Qualified_Leads"); if(s) s.appendRow([data.business_name,data.address,data.phone,data.rating,data.review_count,data.website,data.email,data.maps_url,data.keyword,data.personalization_line,data.email_sent]); }
     else if (action === "update_config") { var s=ss.getSheetByName("Config"); if(s){s.clearContents();s.appendRow(["keyword_seed","location","target_leads","min_rating","max_rating","email_required","status"]);s.appendRow([data.keyword_seed,data.location,data.target_leads,data.min_rating,data.max_rating,data.email_required,data.status]);} }
-    else if (action === "update_email_sent") { var s=ss.getSheetByName("Qualified_Leads"); if(s){var v=s.getDataRange().getValues();for(var i=1;i<v.length;i++){if(v[i][1]===data.email){s.getRange(i+1,6).setValue(data.personalization_line);s.getRange(i+1,7).setValue("yes");break;}}} }
+    else if (action === "update_email_sent") { var s=ss.getSheetByName("Qualified_Leads"); if(s){var v=s.getDataRange().getValues();for(var i=1;i<v.length;i++){if(v[i][6]===data.email){s.getRange(i+1,10).setValue(data.personalization_line);s.getRange(i+1,11).setValue("yes");break;}}} }
     return ContentService.createTextOutput(JSON.stringify({status:"success"})).setMimeType(ContentService.MimeType.JSON);
   } catch(e) { return ContentService.createTextOutput(JSON.stringify({status:"error",message:e.toString()})).setMimeType(ContentService.MimeType.JSON); }
   finally { lock.releaseLock(); }
@@ -1552,7 +1649,7 @@ function doGet(e) { return ContentService.createTextOutput(JSON.stringify({statu
       </div>
       <div class="form-group" style="margin-bottom:12px">
         <label>🔗 Database Web App URL</label>
-        <input id="db-webhook-url" class="inp" placeholder="https://script.google.com/macros/s/AKfycb.../exec">
+        <input id="db-webhook-url" class="inp" placeholder="Locked - Requires PIN" disabled>
       </div>
       <button onclick="saveDBWebhook()" class="btn btn-primary btn-full"><i class="fa-solid fa-link"></i>Connect Database</button>
     </div>
@@ -1566,7 +1663,9 @@ function doGet(e) { return ContentService.createTextOutput(JSON.stringify({statu
         <i class="fa-solid fa-circle-info"></i>
         <span>Go to <a href="https://script.google.com" target="_blank" style="color:var(--blue)">script.google.com</a> → paste code → Deploy as Web App (Anyone) → copy URL.</span>
       </div>
-      <textarea readonly class="inp" style="font-family:monospace;font-size:11px;height:110px;resize:none;margin-bottom:14px;color:var(--blue)">
+      <div style="position:relative;margin-bottom:14px">
+        <button onclick="unlockSettings()" class="btn btn-ghost btn-unlock" style="position:absolute;top:8px;right:8px;font-size:11px;padding:5px 10px;z-index:1"><i class="fa-solid fa-lock"></i> Unlock</button>
+        <textarea readonly class="inp" style="font-family:monospace;font-size:11px;height:110px;resize:none;color:var(--blue)">
 function doPost(e) {
   try {
     var data = JSON.parse(e.postData.contents);
@@ -1576,9 +1675,10 @@ function doPost(e) {
     return ContentService.createTextOutput(JSON.stringify({"status":"error","message":err.toString()})).setMimeType(ContentService.MimeType.JSON);
   }
 }</textarea>
+      </div>
       <div class="form-group" style="margin-bottom:12px">
         <label>🔗 Email Web App URL</label>
-        <input id="webhook-url" class="inp" placeholder="https://script.google.com/macros/s/AKfycb.../exec">
+        <input id="webhook-url" class="inp" placeholder="Locked - Requires PIN" disabled>
       </div>
       <button onclick="saveWebhook()" class="btn btn-success btn-full"><i class="fa-solid fa-save"></i>Save Email Webhook</button>
     </div>
@@ -1630,6 +1730,22 @@ function doPost(e) {
 // ════════════════════════════════════════════════════
 let jid = null, templates = [], historyData = [], tableShown = false;
 let pollTimer = null;
+
+// [PROBLEM 3] PIN Lock System for Settings
+function unlockSettings() {
+    let pin = prompt("Enter PIN to unlock settings:");
+    if (pin === "0123") {
+        document.getElementById('webhook-url').disabled = false;
+        document.getElementById('db-webhook-url').disabled = false;
+        document.querySelectorAll('.btn-unlock').forEach(b => {
+            b.innerHTML = '<i class="fa-solid fa-lock-open"></i> Unlocked';
+            b.style.color = 'var(--green)';
+        });
+        alert("Settings unlocked successfully.");
+    } else {
+        alert("Incorrect PIN.");
+    }
+}
 
 // [REFRESH FIX] On load: restore persisted state BEFORE anything else
 window.onload = async () => {
@@ -2001,7 +2117,7 @@ def download(job_id):
 
 
 # ════════════════════════════════════════════════════
-#   TELEGRAM BOT  (PRESERVED — UNCHANGED)
+#   TELEGRAM BOT  (PRESERVED WITH 1-BY-1 UPDATE)
 # ════════════════════════════════════════════════════
 def to_csv(leads):
     tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False,
@@ -2086,18 +2202,16 @@ def run_bot_scrape_fast(data: dict) -> list:
 
     used_keywords    = set()
     pending_keywords = [base_keyword]
-    keywords_generated = False
     final_leads = []
 
+    # [PROBLEM 2] STRICT 1-BY-1 KEYWORD LOOP FOR TELEGRAM
     while len(final_leads) < max_leads:
         if not pending_keywords:
-            if not keywords_generated:
-                new_kws = kw_engine.generate_full_pool(base_keyword, location, used_keywords)
-                keywords_generated = True
+            new_kw = kw_engine.generate_single_keyword(base_keyword, location, used_keywords)
+            if new_kw:
+                pending_keywords.append(new_kw)
             else:
-                new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
-            random.shuffle(new_kws)
-            pending_keywords.extend(new_kws)
+                break
 
         current_kw = pending_keywords.pop(0)
         used_keywords.add(current_kw.lower())
@@ -2111,17 +2225,27 @@ def run_bot_scrape_fast(data: dict) -> list:
                     if float(lead['Rating']) > max_rating_float: continue
                 except: pass
 
+            # [PROBLEM 1] WEBSITE EXTRACT PIPELINE FOR BOT
             website = lead['Website']
+            if not m_scraper.is_valid_website(website): website = "N/A"
+
+            if website == "N/A" and lead.get('Maps_Link') != "N/A":
+                website = m_scraper.fetch_website_from_details(lead['Maps_Link'])
+
             if website == "N/A":
                 website = m_scraper.find_website_via_search(lead['Name'], location)
-                lead['Website'] = website
+                
+            lead['Website'] = website
             if website == "N/A": continue
 
-            if dedup.is_duplicate(lead['Name'], website, ""): continue
+            # [PROBLEM 5] DEDUPLICATION
+            if dedup.is_duplicate(lead['Name'], location, website, ""): continue
+            
             extracted_email = e_lib.get_email(website)
             if extracted_email == "N/A": continue
-            if dedup.is_duplicate(lead['Name'], website, extracted_email): continue
-            dedup.register(lead['Name'], website, extracted_email)
+            
+            if dedup.is_duplicate(lead['Name'], location, website, extracted_email): continue
+            dedup.register(lead['Name'], location, website, extracted_email)
 
             lead['Email'] = extracted_email
             final_leads.append(lead)
