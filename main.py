@@ -1,4 +1,4 @@
-import os, csv, asyncio, tempfile, threading, io, uuid, re, time, json, urllib.parse, random, datetime
+import os, csv, asyncio, tempfile, threading, io, uuid, re, time, json, urllib.parse, random
 import requests
 import concurrent.futures
 import urllib3
@@ -12,18 +12,15 @@ from telegram.ext import (
     filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 )
 
-# Suppress SSL warnings for cleaner logs
+# Suppress SSL warnings for cleaner logs and slightly faster requests
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv()
 
 # ==========================================
-# ⚙️ CONFIGURATION & TIMEZONE
+# ⚙️ CONFIGURATION
 # ==========================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-# BD Timezone (UTC+6)
-BD_TZ = datetime.timezone(datetime.timedelta(hours=6))
 
 def get_headers():
     HEADERS_LIST = [
@@ -42,23 +39,25 @@ def get_headers():
 #   [NEW] GOOGLE SHEETS ASYNC DATABASE WRAPPER
 # ══════════════════════════════════════════════
 class GoogleSheetsDB:
+    """Handles all database operations asynchronously so it doesn't slow down the scraper."""
     def __init__(self, webhook_url):
         self.url = webhook_url
 
     def _post_async(self, payload):
         try:
             requests.post(self.url, json=payload, timeout=15)
-        except Exception:
-            pass 
+        except Exception as e:
+            pass # Fail silently in background to prevent crashing
 
     def send_action(self, action, data):
         if not self.url: return
         payload = {"action": action, "data": data}
+        # Fire and forget thread
         threading.Thread(target=self._post_async, args=(payload,), daemon=True).start()
 
     def log(self, action, details):
         self.send_action("log", {
-            "timestamp": datetime.datetime.now(BD_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "action": action,
             "details": details
         })
@@ -123,25 +122,6 @@ class GoogleMapsScraper:
         return all_leads
 
 # ══════════════════════════════════════════════
-#   [UPGRADE] AGGRESSIVE WEBSITE EXTRACTION
-# ══════════════════════════════════════════════
-def fallback_website_search(name, location):
-    """If Maps doesn't have a website, search Google organically to find it."""
-    query = urllib.parse.quote_plus(f'"{name}" {location} official website -facebook -instagram -yelp -yellowpages -linkedin')
-    url = f"https://www.google.com/search?q={query}"
-    try:
-        res = requests.get(url, headers=get_headers(), timeout=5)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        for a in soup.select('a[href]'):
-            href = a.get('href', '')
-            if '/url?q=' in href:
-                clean = urllib.parse.unquote(href.split('/url?q=')[1].split('&')[0])
-                if clean.startswith('http') and 'google' not in clean:
-                    return clean
-    except: pass
-    return "N/A"
-
-# ══════════════════════════════════════════════
 #   2. DEEP EMAIL EXTRACTOR
 # ══════════════════════════════════════════════
 class DeepEmailExtractor:
@@ -158,6 +138,7 @@ class DeepEmailExtractor:
         if not url.startswith('http'): url = 'http://' + url
         
         visited_urls = set()
+        
         try:
             r = requests.get(url, headers=get_headers(), timeout=6, verify=False)
             visited_urls.add(url)
@@ -184,19 +165,20 @@ class DeepEmailExtractor:
                     if valid_emails2: return valid_emails2[0]
                 except:
                     continue
+                    
         except: pass
         return "N/A"
 
 # ══════════════════════════════════════════════
-#   3. [UPGRADE] MASSIVE KEYWORD & SMART EMAIL AI
+#   3. AI KEYWORD GENERATOR & PERSONALIZER
 # ══════════════════════════════════════════════
 def generate_ai_keywords(base_kw, location, used_kws):
-    """Original LLM keyword generator."""
-    fallback = [f"best {base_kw}", f"top {base_kw}", f"{base_kw} services", f"affordable {base_kw}", f"{base_kw} agency", f"{base_kw} near me"]
+    fallback = [f"best {base_kw}", f"top {base_kw}", f"{base_kw} services", f"affordable {base_kw}", f"{base_kw} agency", f"{base_kw} near me", f"{base_kw} company", f"{base_kw} experts"]
     if not GROQ_API_KEY: return fallback
     try:
         client = Groq(api_key=GROQ_API_KEY)
-        prompt = f"I am searching for '{base_kw}' in '{location}'. Used keywords: {list(used_kws)}. Generate 50 NEW, highly related search terms/categories. Return ONLY a comma-separated list."
+        # UPGRADED: Now asks for 100+ keywords to ensure massive pool
+        prompt = f"I am searching for '{base_kw}' in '{location}'. Used keywords: {list(used_kws)}. Generate 100 NEW, highly related search terms/categories. Return ONLY a comma-separated list."
         res = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama3-8b-8192",
@@ -208,45 +190,18 @@ def generate_ai_keywords(base_kw, location, used_kws):
     except:
         return fallback
 
-def generate_massive_keywords(base_kw, location, used_kws):
-    """[NEW] Hybrid Engine: Guarantees 100+ keywords using LLM + Google Autosuggest."""
-    kws = set()
-    # 1. Get LLM Keywords
-    llm_kws = generate_ai_keywords(base_kw, location, used_kws)
-    kws.update(llm_kws)
-    
-    # 2. Get Google Autosuggest Keywords (Massive Expansion)
-    prefixes = ['', 'best ', 'top ', 'cheap ', 'local ']
-    suffixes = [' near me', ' services', ' agency', ' company']
-    for p in prefixes:
-        for s in suffixes:
-            q = f"{p}{base_kw}{s} in {location}"
-            try:
-                res = requests.get(f"http://suggestqueries.google.com/complete/search?client=chrome&q={urllib.parse.quote(q)}", timeout=5)
-                suggestions = json.loads(res.text)[1]
-                kws.update(suggestions)
-            except: pass
-            
-    valid_kws = [k for k in kws if k.lower() not in used_kws and len(k)>3]
-    return list(valid_kws)
-
 def personalize_email(lead_name, niche, template_subject, template_body, rating):
-    """[UPGRADE] Smart, human-like personalization referencing exact ratings."""
     if not GROQ_API_KEY: return template_subject, template_body, ""
     try:
         client = Groq(api_key=GROQ_API_KEY)
+        # UPGRADED: Now generates a specific personalization line based on rating/niche
         prompt = f"""
-        You are an expert, human-like cold email copywriter. Personalize this email for a business.
+        You are an expert cold email copywriter. Personalize this email for a business.
         Business Name: {lead_name}
         Niche: {niche}
-        Current Google Rating: {rating} 
-        
-        INSTRUCTIONS:
-        1. If the rating is below 4.0, gently mention it as a pain point (e.g., "I noticed your rating is {rating}, we help businesses improve this...").
-        2. If the rating is high or N/A, compliment their reputation.
-        3. Keep the tone natural, NOT spammy.
-        4. Original Subject: {template_subject}
-        5. Original Body: {template_body}
+        Current Rating: {rating} (If below 4.0, mention helping them improve it. If high, compliment it).
+        Original Subject: {template_subject}
+        Original Body: {template_body}
         
         Return ONLY a valid JSON object with keys:
         "subject" (personalized subject),
@@ -256,7 +211,7 @@ def personalize_email(lead_name, niche, template_subject, template_body, rating)
         res = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama3-8b-8192",
-            temperature=0.6,
+            temperature=0.5,
         )
         content = res.choices[0].message.content
         json_match = re.search(r'\{.*\}', content, re.DOTALL)
@@ -264,7 +219,7 @@ def personalize_email(lead_name, niche, template_subject, template_body, rating)
             data = json.loads(json_match.group(0))
             return data.get("subject", template_subject), data.get("body", template_body), data.get("personalization_line", "")
         return template_subject, template_body, ""
-    except Exception:
+    except Exception as e:
         return template_subject, template_body, ""
 
 # ══════════════════════════════════════════════
@@ -277,18 +232,16 @@ def run_job_thread(job_id, data):
         max_leads = min(int(data.get('max_leads', 10)), 200)
         max_rating = data.get('max_rating')
         webhook_url = data.get('webhook_url')
-        db_webhook_url = data.get('db_webhook_url')
+        db_webhook_url = data.get('db_webhook_url') # NEW: DB Webhook
         templates = data.get('templates', [])
         
         maps_scraper = GoogleMapsScraper()
         email_lib = DeepEmailExtractor()
         db = GoogleSheetsDB(db_webhook_url)
         
-        jobs[job_id]['status'] = 'scraping'
-        jobs[job_id]['count'] = 0
-        jobs[job_id]['leads'] = []
-        jobs[job_id]['status_text'] = 'Starting Massive Keyword Generation...'
+        jobs[job_id] = {'status': 'scraping', 'count': 0, 'leads': [], 'status_text': 'Starting AI Keyword Generation...'}
         
+        # [DB] Initialize Sheets & Config
         if db_webhook_url:
             db.send_action("init", {})
             db.send_action("update_config", {
@@ -306,10 +259,10 @@ def run_job_thread(job_id, data):
             
             if not pending_keywords:
                 jobs[job_id]['status_text'] = f"Generating 100+ new keywords for '{base_keyword}'..."
-                # [UPGRADE] Use massive keyword generator
-                new_kws = generate_massive_keywords(base_keyword, location, used_keywords)
+                new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
                 pending_keywords.extend(new_kws)
                 
+                # [DB] Save generated keywords
                 for kw in new_kws:
                     db.send_action("add_keyword", {"keyword": kw, "source_seed": base_keyword, "status": "pending"})
                 
@@ -322,35 +275,25 @@ def run_job_thread(job_id, data):
             if not raw_leads:
                 continue 
             
-            # [UPGRADE] NEGATIVE BUSINESS TARGETING: Sort by rating ascending (lowest first)
-            def parse_rating(r):
-                try: return float(r)
-                except: return 999.0 # Push N/A to the bottom
-            raw_leads.sort(key=lambda x: parse_rating(x['Rating']))
-            
             for lead in raw_leads:
                 if len(jobs[job_id]['leads']) >= max_leads:
-                    break 
+                    break # Target Hit!
                     
                 if lead['Name'] in seen_names:
                     continue
                 
-                # Apply Rating Filter strictly
-                if max_rating and lead['Rating'] != "N/A":
-                    try:
-                        if float(lead['Rating']) > float(max_rating): continue
-                    except: pass
-
-                # [UPGRADE] AGGRESSIVE WEBSITE EXTRACTION
-                if lead['Website'] == "N/A":
-                    jobs[job_id]['status_text'] = f"Finding missing website for: {lead['Name']}..."
-                    lead['Website'] = fallback_website_search(lead['Name'], location)
-
+                # [DB] Save raw scraped business
                 db.send_action("add_scraped", {
                     "business_name": lead['Name'], "address": lead['Address'], "phone": lead['Phone'],
                     "rating": lead['Rating'], "review_count": "N/A", "website": lead['Website'],
                     "keyword": current_kw, "status": "scraped"
                 })
+
+                # Apply Rating Filter
+                if max_rating and lead['Rating'] != "N/A":
+                    try:
+                        if float(lead['Rating']) > float(max_rating): continue
+                    except: pass
 
                 if lead['Website'] == "N/A":
                     continue 
@@ -361,11 +304,13 @@ def run_job_thread(job_id, data):
                 if extracted_email == "N/A":
                     continue 
                 
+                # [DB] Save Email Lead
                 db.send_action("add_email_lead", {
                     "business_name": lead['Name'], "website": lead['Website'],
                     "email": extracted_email, "source_page": lead['Website'], "status": "qualified"
                 })
                 
+                # [DB] Move to Qualified Leads
                 db.send_action("add_qualified", {
                     "business_name": lead['Name'], "email": extracted_email, "website": lead['Website'],
                     "rating": lead['Rating'], "keyword": current_kw, "personalization_line": "Pending AI...", "email_sent": "no"
@@ -382,6 +327,7 @@ def run_job_thread(job_id, data):
             
         final_leads = jobs[job_id]['leads']
         
+        # [DB] Update Config to Stopped
         db.send_action("update_config", {
             "keyword_seed": base_keyword, "location": location, "target_leads": max_leads,
             "min_rating": "", "max_rating": max_rating or "", "email_required": "true", "status": "stopped"
@@ -398,6 +344,7 @@ def run_job_thread(job_id, data):
                 jobs[job_id]['status_text'] = f"Sending personalized email {emails_sent+1}/{jobs[job_id]['total_to_send']} to {lead['Email']}..."
                 
                 template = random.choice(templates)
+                # UPGRADED: Now generates personalization line
                 p_subject, p_body, p_line = personalize_email(lead['Name'], base_keyword, template['subject'], template['body'], lead['Rating'])
                 
                 payload = {"to": lead['Email'], "subject": p_subject, "body": p_body}
@@ -406,6 +353,7 @@ def run_job_thread(job_id, data):
                     emails_sent += 1
                     jobs[job_id]['emails_sent'] = emails_sent
                     
+                    # [DB] Update Email Sent Status & Personalization Line
                     db.send_action("update_email_sent", {"email": lead['Email'], "personalization_line": p_line})
                     db.log("Email Sent", f"Sent to {lead['Email']}")
                 except Exception as e:
@@ -417,6 +365,7 @@ def run_job_thread(job_id, data):
                         jobs[job_id]['status_text'] = f"Anti-Spam: Waiting {i}s before sending next email..."
                         time.sleep(1)
         
+        # --- FINISHED ---
         jobs[job_id]['status'] = 'done'
         jobs[job_id]['status_text'] = 'Process Completed Successfully!'
         db.log("Job Complete", "All tasks finished successfully.")
@@ -424,42 +373,6 @@ def run_job_thread(job_id, data):
     except Exception as e:
         jobs[job_id] = {'status': 'error', 'error': str(e)}
         if 'db' in locals(): db.log("Error", str(e))
-
-# ══════════════════════════════════════════════
-#   [NEW] MULTI-KEYWORD QUEUE & SCHEDULER
-# ══════════════════════════════════════════════
-job_queue = []
-active_job_id = None
-
-def queue_manager():
-    """Background thread that processes jobs sequentially based on BD Time schedule."""
-    global active_job_id
-    while True:
-        now = datetime.datetime.now(BD_TZ)
-        
-        # Check if current active job is finished
-        if active_job_id:
-            status = jobs.get(active_job_id, {}).get('status')
-            if status in ['done', 'error']:
-                active_job_id = None
-                
-        # If no active job, find the next pending job that is ready to run
-        if not active_job_id:
-            for q_job in job_queue:
-                if q_job['status'] == 'pending':
-                    # Check schedule
-                    sch_time = q_job.get('scheduled_time')
-                    if not sch_time or sch_time <= now:
-                        q_job['status'] = 'running'
-                        active_job_id = q_job['id']
-                        jobs[active_job_id] = {'status': 'queued', 'status_text': 'Initializing...'}
-                        # Start the worker thread
-                        threading.Thread(target=run_job_thread, args=(active_job_id, q_job['data']), daemon=True).start()
-                        break
-        time.sleep(10)
-
-# Start the queue manager
-threading.Thread(target=queue_manager, daemon=True).start()
 
 # ══════════════════════════════════════════════
 #   FLASK DASHBOARD & API
@@ -532,7 +445,7 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
 
   <!-- TABS -->
   <div class="flex gap-2 mb-5 overflow-x-auto pb-1">
-    <button class="tab on" id="tab-search" onclick="showTab('search')"><i class="fa-solid fa-search mr-1.5"></i>Search & Queue</button>
+    <button class="tab on" id="tab-search" onclick="showTab('search')"><i class="fa-solid fa-search mr-1.5"></i>Search & Run</button>
     <button class="tab" id="tab-database" onclick="showTab('database')"><i class="fa-solid fa-database mr-1.5"></i>Connect Database</button>
     <button class="tab" id="tab-connect" onclick="showTab('connect')"><i class="fa-solid fa-paper-plane mr-1.5"></i>Connect Email</button>
     <button class="tab" id="tab-templates" onclick="showTab('templates')"><i class="fa-solid fa-envelope-open-text mr-1.5"></i>Templates</button>
@@ -552,31 +465,10 @@ body{background:#060b18;color:#cbd5e1;font-family:'Inter',system-ui,sans-serif;m
         <div><label class="text-xs text-slate-500 mb-1.5 block">🔢 Exact Target (Max 200)</label><input id="m-count" type="number" max="200" value="10" class="inp"></div>
         <div><label class="text-xs text-slate-500 mb-1.5 block">⭐ Max Rating (Optional - For Bad Reviews)</label><input id="m-rating" type="number" step="0.1" class="inp" placeholder="e.g. 3.5"></div>
       </div>
-      
-      <!-- SCHEDULING -->
-      <div class="p-4 mb-5 rounded-xl bg-slate-800/50 border border-slate-700">
-        <label class="text-xs text-slate-400 mb-2 block"><i class="fa-regular fa-clock mr-1"></i> Schedule Start (BD Time - Optional)</label>
-        <div class="flex gap-2">
-            <input type="number" id="sch-hr" placeholder="HH" min="1" max="12" class="inp w-20">
-            <input type="number" id="sch-min" placeholder="MM" min="0" max="59" class="inp w-20">
-            <select id="sch-ampm" class="inp w-24"><option value="AM">AM</option><option value="PM">PM</option></select>
-        </div>
-      </div>
-
       <div class="p-3 mb-4 rounded-xl text-xs" style="background:rgba(239,68,68,0.07);border:1px solid rgba(239,68,68,0.2);color:#f87171">
         <i class="fa-solid fa-shield-halved mr-1"></i> <b>Strict Mode:</b> Only leads with valid emails are counted. AI will auto-expand keywords until target is reached.
       </div>
-      
-      <div class="flex gap-3">
-        <button onclick="addToQueue(false)" class="btn-p flex-1 py-3 rounded-xl text-sm"><i class="fa-solid fa-play mr-2"></i>Run Now</button>
-        <button onclick="addToQueue(true)" class="btn-b flex-1 py-3 rounded-xl text-sm"><i class="fa-solid fa-list-ol mr-2"></i>Add to Queue</button>
-      </div>
-    </div>
-
-    <!-- QUEUE DISPLAY -->
-    <div class="card p-5 mb-4 fade">
-      <h3 class="font-bold text-white text-sm mb-3"><i class="fa-solid fa-layer-group text-blue-400 mr-2"></i>Job Queue</h3>
-      <div id="queue-list" class="space-y-2 text-xs"></div>
+      <button onclick="startJob()" id="btn-run" class="btn-p w-full py-3 rounded-xl text-sm"><i class="fa-solid fa-play mr-2"></i>Start Scraping & Automation</button>
     </div>
 
     <!-- STATUS -->
@@ -781,7 +673,6 @@ window.onload=()=>{
   historyData = JSON.parse(localStorage.getItem('history') || '[]');
   renderTemplates();
   renderHistory();
-  setInterval(fetchQueue, 3000);
 };
 
 function showTab(t){
@@ -882,73 +773,7 @@ function showPV(leads){
   ).join('');
 }
 
-async function fetchQueue() {
-    try {
-        const r = await fetch('/api/queue');
-        const data = await r.json();
-        const qList = document.getElementById('queue-list');
-        if(data.queue.length === 0 && !data.active) {
-            qList.innerHTML = '<div class="text-slate-500">Queue is empty.</div>';
-            return;
-        }
-        
-        let html = '';
-        if(data.active) {
-            html += `<div class="p-2 bg-indigo-900/30 border border-indigo-500/30 rounded flex justify-between">
-                <span><i class="fa-solid fa-play text-indigo-400 mr-2"></i> <b>${data.active.kw}</b> in ${data.active.loc}</span>
-                <span class="text-indigo-300">Running</span>
-            </div>`;
-            jid = data.active.id; // Track active job
-            pollActiveJob();
-        }
-        
-        data.queue.forEach(q => {
-            let timeStr = q.sch ? `Scheduled: ${q.sch}` : 'Pending';
-            html += `<div class="p-2 bg-slate-800/50 border border-slate-700 rounded flex justify-between">
-                <span><i class="fa-solid fa-clock text-slate-400 mr-2"></i> <b>${q.kw}</b> in ${q.loc}</span>
-                <span class="text-slate-400">${timeStr}</span>
-            </div>`;
-        });
-        qList.innerHTML = html;
-    } catch(e) {}
-}
-
-async function pollActiveJob() {
-    if(!jid) return;
-    try {
-        const r2 = await fetch('/api/status/'+jid); 
-        const d2 = await r2.json();
-        if(d2.status==='not_found') return;
-        
-        if(d2.status==='scraping'){
-            setSt(d2.status_text, 'load', Math.max(5, (d2.count/10)*100)); // Approx pct
-            if(d2.leads && d2.leads.length > 0) {
-                updStats(d2.leads);
-                if(!tableShown) { showPV(d2.leads); tableShown=true; }
-            }
-        }
-        else if(d2.status==='sending_emails'){
-            if(!tableShown && d2.leads) {
-                updStats(d2.leads); showPV(d2.leads); tableShown = true;
-            }
-            document.getElementById('dlbtn').classList.remove('hidden');
-            let emailPct = d2.total_to_send > 0 ? (d2.emails_sent / d2.total_to_send) * 100 : 100;
-            setSt(d2.status_text, 'email', Math.max(5, emailPct));
-        }
-        else if(d2.status==='done'){
-            if(d2.leads) { updStats(d2.leads); showPV(d2.leads); }
-            setSt(d2.status_text, 'done', 100);
-            document.getElementById('dlbtn').classList.remove('hidden');
-            jid = null; // Reset so next job can be tracked
-        } 
-        else if(d2.status==='error'){
-            setSt(d2.error, 'err');
-            jid = null;
-        }
-    } catch(e) {}
-}
-
-async function addToQueue(isScheduled){
+async function startJob(){
   const loc=document.getElementById('m-loc').value.trim();
   const kw=document.getElementById('m-kw').value.trim();
   let count=parseInt(document.getElementById('m-count').value)||10;
@@ -963,38 +788,70 @@ async function addToQueue(isScheduled){
   if(!webhook && templates.length > 0) alert("Warning: Email Webhook URL is missing. Emails will NOT be sent.");
   if(webhook && templates.length === 0) alert("Warning: No templates added. Emails will NOT be sent.");
 
-  let schTime = null;
-  if(isScheduled) {
-      const hr = document.getElementById('sch-hr').value;
-      const min = document.getElementById('sch-min').value;
-      const ampm = document.getElementById('sch-ampm').value;
-      if(hr && min) {
-          schTime = `${hr}:${min} ${ampm}`;
-      }
-  }
+  setSt('Initializing AI Search Engine...','load',5);
+  document.getElementById('dlbtn').classList.add('hidden');
+  document.getElementById('pvbox').classList.add('hidden');
+  document.getElementById('btn-run').disabled=true;
+  tableShown = false;
 
   const payload = {
     location: loc, keyword: kw, max_leads: count,
     max_rating: document.getElementById('m-rating').value || null,
-    webhook_url: webhook, db_webhook_url: db_webhook, templates: templates,
-    schedule: schTime
+    webhook_url: webhook, db_webhook_url: db_webhook, templates: templates
   };
 
   try {
-      const r = await fetch('/api/queue/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      const r = await fetch('/api/scrape',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
       const d = await r.json();
-      if(d.error){ alert(d.error); return; }
-      
+      if(d.error){ setSt(d.error,'err'); document.getElementById('btn-run').disabled=false; return; }
+      jid = d.job_id;
+
       historyData.unshift({loc: loc, kw: kw, target: count, date: new Date().toLocaleString()});
       localStorage.setItem('history', JSON.stringify(historyData)); renderHistory();
-      
-      alert(isScheduled && schTime ? `Job Scheduled for ${schTime} BD Time!` : "Job Added to Queue!");
-      fetchQueue();
-      
-      // Clear inputs
-      document.getElementById('m-kw').value = '';
+
+      const poll = async()=>{
+        try {
+            const r2 = await fetch('/api/status/'+jid); 
+            const d2 = await r2.json();
+            
+            if(d2.status==='scraping'){
+                setSt(d2.status_text, 'load', Math.max(5, (d2.count/count)*100));
+                if(d2.leads && d2.leads.length > 0) {
+                    updStats(d2.leads);
+                    if(!tableShown) { showPV(d2.leads); tableShown=true; }
+                }
+                setTimeout(poll, 3000);
+            }
+            else if(d2.status==='sending_emails'){
+                if(!tableShown && d2.leads) {
+                    updStats(d2.leads); showPV(d2.leads); tableShown = true;
+                }
+                document.getElementById('dlbtn').classList.remove('hidden');
+                let emailPct = d2.total_to_send > 0 ? (d2.emails_sent / d2.total_to_send) * 100 : 100;
+                setSt(d2.status_text, 'email', Math.max(5, emailPct));
+                setTimeout(poll, 3000);
+            }
+            else if(d2.status==='done'){
+              document.getElementById('btn-run').disabled=false;
+              if(d2.leads) { updStats(d2.leads); showPV(d2.leads); }
+              setSt(d2.status_text, 'done', 100);
+              document.getElementById('dlbtn').classList.remove('hidden');
+            } 
+            else if(d2.status==='error'){
+              document.getElementById('btn-run').disabled=false;
+              setSt(d2.error, 'err');
+            }
+            else {
+              setTimeout(poll, 3000);
+            }
+        } catch(e) {
+            setTimeout(poll, 3000);
+        }
+      };
+      setTimeout(poll, 2000);
   } catch(e) {
-      alert('Failed to connect to server.');
+      setSt('Failed to connect to server.','err');
+      document.getElementById('btn-run').disabled=false;
   }
 }
 
@@ -1007,43 +864,14 @@ function doDL(){ if(jid) window.location='/api/download/'+jid; }
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@flask_app.route('/api/queue/add', methods=['POST'])
-def add_to_queue():
+@flask_app.route('/api/scrape', methods=['POST'])
+def start_api_job():
     data = request.json
     job_id = str(uuid.uuid4())[:8]
-    
-    sch_dt = None
-    if data.get('schedule'):
-        try:
-            # Parse "HH:MM AM/PM" into today's date in BD Time
-            now = datetime.datetime.now(BD_TZ)
-            t = datetime.datetime.strptime(data['schedule'], "%I:%M %p").time()
-            sch_dt = datetime.datetime.combine(now.date(), t, tzinfo=BD_TZ)
-            if sch_dt < now:
-                sch_dt += datetime.timedelta(days=1) # Schedule for tomorrow if time passed
-        except: pass
-
-    job_queue.append({
-        'id': job_id,
-        'data': data,
-        'scheduled_time': sch_dt,
-        'status': 'pending'
-    })
-    return jsonify({'job_id': job_id, 'status': 'queued'})
-
-@flask_app.route('/api/queue')
-def get_queue():
-    q_list = []
-    active = None
-    for q in job_queue:
-        if q['status'] == 'pending':
-            q_list.append({
-                'kw': q['data']['keyword'], 'loc': q['data']['location'],
-                'sch': q['scheduled_time'].strftime("%I:%M %p") if q['scheduled_time'] else None
-            })
-        elif q['status'] == 'running':
-            active = {'id': q['id'], 'kw': q['data']['keyword'], 'loc': q['data']['location']}
-    return jsonify({'queue': q_list, 'active': active})
+    t = threading.Thread(target=run_job_thread, args=(job_id, data))
+    t.daemon = True
+    t.start()
+    return jsonify({'job_id': job_id})
 
 @flask_app.route('/api/status/<job_id>')
 def status(job_id):
@@ -1138,18 +966,13 @@ def run_bot_scrape_fast(data):
     
     while len(final_leads) < max_leads:
         if not pending_keywords:
-            new_kws = generate_massive_keywords(base_keyword, location, used_keywords)
+            new_kws = generate_ai_keywords(base_keyword, location, used_keywords)
             pending_keywords.extend(new_kws)
             
         current_kw = pending_keywords.pop(0)
         used_keywords.add(current_kw.lower())
         
         raw_leads = maps_scraper.fetch_batch(current_kw, location)
-        
-        def parse_rating(r):
-            try: return float(r)
-            except: return 999.0
-        raw_leads.sort(key=lambda x: parse_rating(x['Rating']))
         
         for lead in raw_leads:
             if len(final_leads) >= max_leads: break
@@ -1159,9 +982,6 @@ def run_bot_scrape_fast(data):
                 try:
                     if float(lead['Rating']) > float(max_rating): continue
                 except: pass
-                
-            if lead['Website'] == "N/A":
-                lead['Website'] = fallback_website_search(lead['Name'], location)
                 
             if lead['Website'] == "N/A": continue
                 
@@ -1232,3 +1052,4 @@ if __name__ == "__main__":
         threading.Thread(target=run_telegram_bot, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host='0.0.0.0', port=port)
+
